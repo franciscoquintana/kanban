@@ -62,6 +62,35 @@ captured when the task was armed. If the tip did not advance, the manager logs
 `Commit NOT propagated to baseRef <X> for task <Y> — NOT trashing` and leaves
 the task in review for the user to investigate.
 
+### Resume agents on task restart
+
+When the kanban server is restarted, the per-task agent processes (e.g.
+`claude --dangerously-skip-permissions` for each in-progress task) are killed.
+Their worktrees and chat history persist on disk, but the processes are gone.
+Upstream behaviour: the next time the user clicks Play on the task, the agent
+spawns with a brand-new conversation, losing context.
+
+This fork adds a `resume` flag to `runtime.startTaskSession`. When true, the
+agent is launched with its catalog-defined `resumeArgs` (e.g. `claude
+--continue`) so it picks up the previous chat history for the cwd. The
+worktree is the cwd, so the agent finds its prior session naturally.
+
+**Trigger rule:** the frontend sets `resume: true` whenever the task already
+has a session record (regardless of state), since the only way a session
+record exists is if an agent was running before. New tasks (no session
+record) start fresh. The CLI (`kanban task start --task-id`) follows the same
+rule.
+
+**Coverage:** only `claude` has `resumeArgs` filled in this commit. Other
+agents (codex/droid/kiro/cline) ignore the flag silently and use the
+upstream "always fresh" launch. Cline native is fine because the
+`ClineTaskSessionService` already manages chat history persistence
+internally, independent of process args.
+
+There is **no auto-resume on kanban boot** — the user must click Play (or
+use the CLI) to actually relaunch the agent. This is intentional to avoid
+accidentally restarting many agents without user awareness.
+
 ### Serialization by baseRef
 
 At most one task armed per `baseRef` at a time. Other tasks land in
@@ -91,15 +120,26 @@ connected frontend can play the card move animation locally. Schema lives in
 
 **Modified server files:**
 
+- `src/core/agent-catalog.ts` — added `resumeArgs?: string[]` field; `claude`
+  uses `["--continue"]`. Other agents leave it unset (upstream behaviour
+  preserved).
+- `src/terminal/agent-registry.ts` — `resolveAgentCommand` accepts a second
+  argument `{ resume?: boolean }`. When `resume === true` and the agent has
+  `resumeArgs`, those are prepended to the args list.
 - `src/cli.ts` — create `autoReviewManagerRef`, pass to hub and server
 - `src/core/api-contract.ts` — add `auto_action_pending` schema, wire into the
-  state-stream union
+  state-stream union; add `resume?: boolean` to
+  `runtimeTaskSessionStartRequestSchema`.
 - `src/server/runtime-state-hub.ts` — wire-up the manager unconditionally,
   broadcast `auto_action_pending` before triggering moves
 - `src/server/runtime-server.ts` — instantiate `createServerAutoReviewManager`
   with all required dependencies, expose them
 - `src/workspace/git-sync.ts` — add `getBranchTip(repoPath, baseRef)` helper
   using `child_process.spawn` with separated args (no shell)
+- `src/trpc/runtime-api.ts` — pass `body.resume` to `resolveAgentCommand`
+  when launching a task session.
+- `src/commands/task.ts` — `kanban task start --task-id` reads the existing
+  session record; if non-null, sends `resume: true` to the runtime mutation.
 
 **Modified frontend files:**
 
@@ -115,6 +155,11 @@ connected frontend can play the card move animation locally. Schema lives in
 - `web-ui/src/hooks/use-git-actions.ts` — `runAutoReviewGitAction` is no longer
   invoked from the auto-review hook; manual buttons keep using it via the same
   exports
+- `web-ui/src/hooks/use-task-sessions.ts` — `StartTaskSessionOptions` accepts
+  `resume?: boolean`, forwarded to the tRPC mutation.
+- `web-ui/src/hooks/use-board-interactions.ts` — `kickoffTaskInProgress`
+  computes `shouldResume = sessions[taskId] != null` and passes it to
+  `startTaskSession`.
 
 ## How to rebase against upstream
 

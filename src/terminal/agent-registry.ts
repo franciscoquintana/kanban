@@ -79,20 +79,33 @@ function getCuratedDefinitions(runtimeConfig: RuntimeConfigState, detected: stri
 	});
 }
 
-export function resolveAgentCommand(runtimeConfig: RuntimeConfigState): ResolvedAgentCommand | null {
+export interface ResolveAgentCommandOptions {
+	// When true, prepend the agent's `resumeArgs` (if any) to the args list so
+	// the spawned process attaches to the prior session in the cwd instead of
+	// starting fresh. Only set this when the caller knows there's a previous
+	// session worth resuming (see fork doc on the rule).
+	resume?: boolean;
+}
+
+export function resolveAgentCommand(
+	runtimeConfig: RuntimeConfigState,
+	options: ResolveAgentCommandOptions = {},
+): ResolvedAgentCommand | null {
 	const selected = getRuntimeLaunchSupportedAgentCatalog().find((entry) => entry.id === runtimeConfig.selectedAgentId);
 	if (!selected) {
 		return null;
 	}
 	const defaultArgs = getDefaultArgs(selected.id);
-	const command = joinCommand(selected.binary, defaultArgs);
+	const resumeArgs = options.resume === true ? (selected.resumeArgs ?? []) : [];
+	const args = [...resumeArgs, ...defaultArgs];
+	const command = joinCommand(selected.binary, args);
 	if (isBinaryAvailableOnPath(selected.binary)) {
 		return {
 			agentId: selected.id,
 			label: selected.label,
 			command,
 			binary: selected.binary,
-			args: defaultArgs,
+			args,
 		};
 	}
 	return null;

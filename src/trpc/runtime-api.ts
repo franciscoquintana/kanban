@@ -270,7 +270,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					effectiveAgentId !== scopedRuntimeConfig.selectedAgentId
 						? { ...scopedRuntimeConfig, selectedAgentId: effectiveAgentId }
 						: scopedRuntimeConfig;
-				const resolved = resolveAgentCommand(resolvedConfig);
+				const resolved = resolveAgentCommand(resolvedConfig, { resume: body.resume === true });
 				if (!resolved) {
 					return {
 						ok: false,

@@ -46,6 +46,13 @@ interface StartTaskSessionResult {
 
 interface StartTaskSessionOptions {
 	resumeFromTrash?: boolean;
+	/**
+	 * If true, ask the agent to resume its prior chat history for this task's
+	 * worktree (e.g. `claude --continue`) instead of starting a fresh session.
+	 * Used when relaunching a task whose previous agent process died (e.g. after
+	 * a kanban server restart). See `.plan/docs/fork-server-side-auto-review.md`.
+	 */
+	resume?: boolean;
 }
 
 export interface UseTaskSessionsResult {
@@ -161,6 +168,7 @@ export function useTaskSessions({ currentProjectId, setSessions }: UseTaskSessio
 					images: options?.resumeFromTrash ? undefined : task.images,
 					startInPlanMode: options?.resumeFromTrash ? undefined : task.startInPlanMode,
 					resumeFromTrash: options?.resumeFromTrash,
+					resume: options?.resume,
 					baseRef: task.baseRef,
 					cols: geometry.cols,
 					rows: geometry.rows,
