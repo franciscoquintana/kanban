@@ -117,10 +117,14 @@ async function resumeWorkspace(input: ResumeWorkspaceInput): Promise<void> {
 		return;
 	}
 	const candidates = inProgressColumn.cards.filter((card) => {
-		const summary = sessions[card.id];
-		// Skip tasks that are already running. Skip tasks that never ran (no
-		// summary record) — those have no chat history to continue.
-		return summary !== undefined && summary.state !== "running";
+		// At boot time, any process kanban spawned in its previous lifetime is
+		// dead (children of a parent process that no longer exists). The
+		// persisted `state` field in sessions.json is therefore stale —
+		// including the "running" entries. Trust the column position instead:
+		// a card in `in_progress` with any session record needs respawn.
+		// Cards without a session record (clean board) are skipped because
+		// `claude --continue` would fail with "No conversations to continue".
+		return sessions[card.id] !== undefined;
 	});
 	input.onCandidateCount(candidates.length);
 	if (candidates.length === 0) {
