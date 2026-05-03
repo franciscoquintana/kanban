@@ -47,9 +47,11 @@ import { createProjectsApi } from "../trpc/projects-api";
 import { createRuntimeApi } from "../trpc/runtime-api";
 import { createWorkspaceApi } from "../trpc/workspace-api";
 import { getWebUiDir, normalizeRequestPath, readAsset } from "./assets";
+import { resumeInProgressTasksOnBoot } from "./auto-resume-on-boot";
 import { handleHttpRequest, handleSocketUpgrade } from "./middleware";
 import type { RuntimeStateHub } from "./runtime-state-hub";
 import { createServerAutoReviewManager, type ServerAutoReviewManager } from "./server-auto-review-manager";
+import { logError } from "./server-log";
 import type { WorkspaceRegistry } from "./workspace-registry";
 
 interface DisposeTrackedWorkspaceResult {
@@ -194,6 +196,16 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		broadcastAutoActionPending: deps.runtimeStateHub.broadcastAutoActionPending,
 	});
 	deps.autoReviewManagerRef.current = serverAutoReviewManager;
+
+	// Auto-resume in_progress claude tasks whose agent processes died with the
+	// previous kanban server. Fire-and-forget: we don't want to block server
+	// startup if a workspace state file is slow or corrupt. See
+	// `.plan/docs/fork-server-side-auto-review.md`.
+	void resumeInProgressTasksOnBoot({
+		workspaceRegistry: deps.workspaceRegistry,
+	}).catch((err) => {
+		logError("[auto-resume] top-level pass failed", err);
+	});
 
 	const prepareForStateReset = async (): Promise<void> => {
 		const workspaceIds = new Set<string>();

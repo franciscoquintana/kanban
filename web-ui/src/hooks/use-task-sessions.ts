@@ -157,7 +157,13 @@ export function useTaskSessions({ currentProjectId, setSessions }: UseTaskSessio
 				return { ok: false, message: "No project selected." };
 			}
 			try {
-				const kickoffPrompt = options?.resumeFromTrash ? "" : task.prompt.trim();
+				// On resume (from trash, or after the agent process died — typically
+				// a kanban server restart), skip the kickoff prompt. The agent
+				// already has its prior conversation via `--continue` (or via
+				// Cline's persisted session), so re-sending the original task
+				// prompt would echo back work the agent has already heard. The
+				// user types whatever they want next.
+				const kickoffPrompt = options?.resumeFromTrash || options?.resume ? "" : task.prompt.trim();
 				const trpcClient = getRuntimeTrpcClient(currentProjectId);
 				const geometry =
 					getTerminalGeometry(task.id) ?? estimateTaskSessionGeometry(window.innerWidth, window.innerHeight);
