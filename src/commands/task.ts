@@ -711,8 +711,11 @@ async function startTask(input: { cwd: string; taskId: string; projectPath?: str
 		}
 
 		const started = await runtimeClient.runtime.startTaskSession.mutate({
+			// On resume the agent already has its prior conversation; sending
+			// the original task prompt would echo work it already heard. The
+			// user types what they want next.
+			prompt: shouldResume ? "" : task.prompt,
 			taskId: task.id,
-			prompt: task.prompt,
 			taskTitle: task.title,
 			startInPlanMode: task.startInPlanMode,
 			baseRef: task.baseRef,

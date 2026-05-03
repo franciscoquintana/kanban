@@ -304,6 +304,12 @@ export async function loadWorkspaceBoardById(workspaceId: string): Promise<Runti
 	return await readWorkspaceBoard(workspaceId);
 }
 
+export async function loadWorkspaceSessionsById(
+	workspaceId: string,
+): Promise<Record<string, RuntimeTaskSessionSummary>> {
+	return await readWorkspaceSessions(workspaceId);
+}
+
 async function readWorkspaceSessions(workspaceId: string): Promise<Record<string, RuntimeTaskSessionSummary>> {
 	const sessionsPath = getWorkspaceSessionsPath(workspaceId);
 	const rawSessions = await readJsonFile(sessionsPath);

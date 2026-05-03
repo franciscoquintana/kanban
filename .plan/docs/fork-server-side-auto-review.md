@@ -87,9 +87,36 @@ upstream "always fresh" launch. Cline native is fine because the
 `ClineTaskSessionService` already manages chat history persistence
 internally, independent of process args.
 
-There is **no auto-resume on kanban boot** — the user must click Play (or
-use the CLI) to actually relaunch the agent. This is intentional to avoid
-accidentally restarting many agents without user awareness.
+**No prompt on resume.** When `resume: true`, the kickoff prompt is sent as
+empty string. The agent already has its prior conversation from
+`--continue`, so re-injecting the original task prompt would echo back work
+the agent has already heard. The user types whatever they want next.
+
+### Auto-resume on kanban boot
+
+`src/server/auto-resume-on-boot.ts` runs once after the runtime server has
+finished wiring. For every managed workspace it scans the persisted board
+plus sessions; for each task in the `in_progress` column whose session
+record is **not** in `running` state, it spawns the agent with
+`resume: true` and an empty prompt. Spawns are staggered by 500 ms to avoid
+a thundering-herd of agent processes.
+
+**Filter — claude only.** Tasks whose effective agent (per-card override →
+last summary → workspace default) is not `claude` are skipped with a log
+line. This is intentional for now: other agent resume flags haven't been
+validated, and Cline native handles its own resume internally.
+
+**Opt-out:** set `KANBAN_DISABLE_AUTO_RESUME=true` (or `1`/`yes`/`on`) to
+skip the entire pass; tasks then stay in `in_progress` with dead agents
+until the user clicks Play, like upstream behaviour.
+
+**Edge cases:**
+
+- Worktree missing on disk → log and skip.
+- Task never had a session record (clean board) → skipped because we use
+  `summary !== undefined` as the signal of resumable history. Without it,
+  `claude --continue` would fail with "No conversations to continue".
+- Spawn fails (claude binary missing, env broken) → log and continue.
 
 ### Serialization by baseRef
 
