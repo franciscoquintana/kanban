@@ -92,6 +92,45 @@ empty string. The agent already has its prior conversation from
 `--continue`, so re-injecting the original task prompt would echo back work
 the agent has already heard. The user types whatever they want next.
 
+### Multi-agent review pipeline in the commit / PR prompt
+
+The default `DEFAULT_COMMIT_PROMPT_TEMPLATE` and `DEFAULT_OPEN_PR_PROMPT_TEMPLATE`
+in `src/config/runtime-config.ts` now instruct the agent to run **four
+parallel reviewer subagents** (via claude code's `Agent` tool) before the
+cherry-pick / PR push:
+
+1. **security-reviewer** — uses `/security-review` skill if available, else
+   inline OWASP-style scan (secrets, injection, authn/authz, unsafe deser,
+   weak crypto, XSS, SSRF, sensitive logs).
+2. **test-reviewer** — verifies sibling test files exist for non-trivial
+   diff entries; flags business logic added without tests as CRITICAL.
+3. **architecture-reviewer** — reads `AGENTS.md`, `CLAUDE.md`, and any
+   `docs/architecture.md` / `docs/hexagonal.md`; checks the diff respects
+   layering, naming, file placement called out there.
+4. **simplify-reviewer** — uses `/simplify` skill if available, else flags
+   over-engineering, premature abstractions, redundant comments, dead error
+   handling, half-finished implementations.
+
+Each reviewer returns a structured report (`STATUS: PASS|WARN|CRITICAL` +
+bullet lists). The main agent aggregates:
+
+- Any CRITICAL → targeted fix → re-launch only the affected reviewer.
+  Repeat until PASS/WARN-only. Hard cap: 3 iterations.
+- WARN-only → log in the final commit/PR report, proceed.
+- All PASS → proceed.
+
+If 3 iterations don't clear CRITICAL, proceed anyway and surface the
+remaining issue in the report — the alternative (task armed forever) is
+worse.
+
+This runs entirely inside claude code via its `Agent` tool, so there is no
+new server-side infrastructure to maintain. The kanban server simply ships
+the richer prompt template; subagent execution stays in the agent process.
+
+**To customize per-project:** users can override `commitPromptTemplate` /
+`openPrPromptTemplate` in Settings (per-workspace runtime-config). The
+default is what we ship in this fork.
+
 ### Auto-resume on kanban boot
 
 `src/server/auto-resume-on-boot.ts` runs once after the runtime server has

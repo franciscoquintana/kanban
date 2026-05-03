@@ -59,6 +59,36 @@ const DEFAULT_AGENT_AUTONOMOUS_MODE_ENABLED = true;
 const DEFAULT_READY_FOR_REVIEW_NOTIFICATIONS_ENABLED = true;
 const DEFAULT_COMMIT_PROMPT_TEMPLATE = `You are in a worktree on a detached HEAD. When you are finished with the task, commit the working changes onto {{base_ref}}.
 
+# Pre-commit review pipeline
+
+Before staging or cherry-picking, run a multi-agent quality review on the diff in this worktree.
+
+Launch the four reviewers below IN PARALLEL using the Agent tool — send a single message with multiple Agent tool calls so they run concurrently. Each reviewer must return a report in this exact format:
+
+  STATUS: PASS | WARN | CRITICAL
+  CRITICAL: <bullet list of must-fix items, file:line where possible>
+  WARN: <bullet list of nice-to-fix items>
+  NOTES: <one short paragraph summary>
+
+Reviewers (run in parallel):
+
+1. Agent(security-reviewer): If the \`/security-review\` skill is available in this environment, use it. Otherwise scan the diff manually. Look for: hard-coded secrets/credentials, SQL injection, command injection, path traversal, missing authn/authz on new endpoints, unsafe deserialization, weak crypto, sensitive data in logs, SSRF, XSS in rendered output. Start with \`git diff --name-only HEAD\` to scope the review. Keep the report under 200 words.
+
+2. Agent(test-reviewer): For each non-trivial file in the diff, check whether there is a corresponding test file (sibling \`*.test.*\`/\`*.spec.*\`, or under \`tests/\` / \`__tests__/\` / \`test/\` for the module). Look for: business logic added without any test (CRITICAL), missing edge-case coverage (WARN), tests that mock the system-under-test instead of testing it (WARN), assertions that don't actually check the right thing. Keep the report under 200 words.
+
+3. Agent(architecture-reviewer): Read the project root \`AGENTS.md\`, \`CLAUDE.md\`, and any \`docs/architecture.md\` or \`docs/hexagonal.md\` if they exist (use Read tool, not Bash cat). Then check that the diff respects: documented layering, naming conventions, file placement (e.g. is a domain entity sneaking infrastructure imports?), DRY principles called out there. Mark CRITICAL only for clear violations of stated rules; speculative concerns go to WARN. Keep the report under 200 words.
+
+4. Agent(simplify-reviewer): If the \`/simplify\` skill is available, use it. Otherwise scan the diff for: error handling for impossible cases, premature abstractions for hypothetical needs, comments that explain WHAT instead of WHY, dead backwards-compatibility shims, redundant input validation at internal boundaries, half-finished implementations, three-line abstractions used in a single call site. Keep the report under 200 words.
+
+Aggregate the four reports. Decision rule:
+- ANY reviewer returns CRITICAL → fix the cited issues with targeted edits, then re-launch only the reviewer(s) that flagged. Repeat until no CRITICAL remains.
+- WARN-only → record them in the final commit report but proceed.
+- All PASS → proceed.
+
+Hard cap: at most 3 review-and-fix iterations. If CRITICAL still remains after 3 rounds, stop iterating, write a clear note describing what is unresolved, and proceed to the commit step anyway — the alternative (leaving the task armed indefinitely) is worse for the human reviewing the board.
+
+# Commit / cherry-pick
+
 - Do not run destructive commands: git reset --hard, git clean -fdx, git worktree remove, rm/mv on repository paths.
 - Do not edit files outside git workflows unless required for conflict resolution.
 - Preserve any pre-existing user uncommitted changes in the base worktree.
@@ -80,8 +110,39 @@ Steps:
    - Final commit message
    - Whether stash was used
    - Whether conflicts were resolved
+   - Reviewer summary: counts of PASS / WARN / CRITICAL and any remaining WARN items
    - Any remaining manual follow-up needed`;
 const DEFAULT_OPEN_PR_PROMPT_TEMPLATE = `You are in a worktree on a detached HEAD. When you are finished with the task, open a pull request against {{base_ref}}.
+
+# Pre-PR review pipeline
+
+Before pushing or opening the PR, run a multi-agent quality review on the diff in this worktree.
+
+Launch the four reviewers below IN PARALLEL using the Agent tool — single message, multiple Agent tool calls. Each reviewer returns:
+
+  STATUS: PASS | WARN | CRITICAL
+  CRITICAL: <bullet list, file:line where possible>
+  WARN: <bullet list>
+  NOTES: <one short paragraph>
+
+Reviewers:
+
+1. Agent(security-reviewer): Use \`/security-review\` if available, else scan the diff for: hard-coded secrets, SQL/command/path injection, missing authn/authz on new endpoints, unsafe deserialization, weak crypto, sensitive logs, SSRF, XSS. <200 words.
+
+2. Agent(test-reviewer): For each non-trivial file in the diff, verify there's a sibling or sibling-folder test file. Flag CRITICAL when business logic is added without any test, WARN for missing edge-case coverage. <200 words.
+
+3. Agent(architecture-reviewer): Read \`AGENTS.md\`, \`CLAUDE.md\`, \`docs/architecture.md\`, \`docs/hexagonal.md\` if present. Check the diff respects documented layering, naming, file placement, DRY. CRITICAL only for clear documented-rule violations. <200 words.
+
+4. Agent(simplify-reviewer): Use \`/simplify\` if available, else flag: error handling for impossible cases, premature abstractions, comments explaining WHAT not WHY, dead backwards-compat shims, redundant validation. <200 words.
+
+Aggregation rule:
+- Any CRITICAL → fix and re-launch only the affected reviewer. Repeat. Hard cap: 3 iterations.
+- WARN-only → keep them; mention in the PR body.
+- All PASS → proceed.
+
+If CRITICAL remains after 3 rounds, proceed anyway and call it out in the PR body so the human reviewer sees the gap.
+
+# Open PR
 
 - Do not run destructive commands: git reset --hard, git clean -fdx, git worktree remove, rm/mv on repository paths.
 - Do not modify the base worktree.
@@ -93,11 +154,16 @@ Steps:
 3. Push the branch to origin and set upstream.
 4. Create a pull request with base {{base_ref}} and head as the pushed branch (use gh CLI if available).
 5. If a pull request already exists for the same head and base, return that existing PR URL instead of creating a duplicate.
-6. If PR creation is blocked, explain exactly why and provide the exact commands to complete it manually.
-7. Report:
+6. The PR body must include:
+   - A short Summary of the change
+   - Reviewer summary: PASS/WARN/CRITICAL counts, plus the bullet list of any remaining WARN/CRITICAL items
+   - Test plan
+7. If PR creation is blocked, explain exactly why and provide the exact commands to complete it manually.
+8. Report:
    - PR title: PR URL
    - Base branch
    - Head branch
+   - Reviewer summary
    - Any follow-up needed`;
 
 export function pickBestInstalledAgentIdFromDetected(detectedCommands: readonly string[]): RuntimeAgentId | null {
