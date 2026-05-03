@@ -329,7 +329,13 @@ export function useBoardInteractions({
 					setTaskWorkspaceInfo(infoAfterEnsure);
 				}
 			}
-			const started = await startTaskSession(task);
+			// If a session record exists for this task, the agent process must
+			// have died (e.g. kanban server restart). Ask the agent to resume
+			// its prior chat history instead of starting fresh. New tasks
+			// (no existing session record) start a clean conversation.
+			const existingSession = sessions[taskId] ?? null;
+			const shouldResume = existingSession !== null;
+			const started = await startTaskSession(task, { resume: shouldResume });
 			if (!started.ok) {
 				notifyError(started.message ?? "Could not start task session.");
 				if (optimisticMove) {
@@ -356,7 +362,7 @@ export function useBoardInteractions({
 			}
 			return true;
 		},
-		[ensureTaskWorkspace, fetchTaskWorkspaceInfo, selectedTaskId, setBoard, startTaskSession],
+		[ensureTaskWorkspace, fetchTaskWorkspaceInfo, selectedTaskId, sessions, setBoard, startTaskSession],
 	);
 
 	const startBacklogTaskImmediately = useCallback(

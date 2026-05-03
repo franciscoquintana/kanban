@@ -6,6 +6,13 @@ export interface RuntimeAgentCatalogEntry {
 	binary: string;
 	baseArgs: string[];
 	autonomousArgs: string[];
+	// Args used to resume the agent's prior session in the current cwd. When
+	// `startTaskSession` is invoked with `{ resume: true }`, these are prepended
+	// to the rest of the args so the spawned process picks up the existing
+	// chat history instead of starting fresh. Only fill for agents that have
+	// a verified resume mechanism — leave undefined to keep the upstream
+	// "always fresh" behaviour. See `.plan/docs/fork-server-side-auto-review.md`.
+	resumeArgs?: string[];
 	installUrl: string;
 }
 
@@ -16,6 +23,13 @@ export const RUNTIME_AGENT_CATALOG: RuntimeAgentCatalogEntry[] = [
 		binary: "claude",
 		baseArgs: [],
 		autonomousArgs: ["--dangerously-skip-permissions"],
+		// `claude --continue` auto-picks the most recent session for the cwd.
+		// Must run with cwd = the task's worktree (which terminal-manager already
+		// does when it spawns the process). If there is no prior session for the
+		// cwd, claude exits with "No conversations to continue", marking the
+		// kanban session as failed; the user can then click Play again, this
+		// time without resume.
+		resumeArgs: ["--continue"],
 		installUrl: "https://docs.anthropic.com/en/docs/claude-code/quickstart",
 	},
 	{

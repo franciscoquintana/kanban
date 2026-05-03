@@ -694,6 +694,12 @@ async function startTask(input: { cwd: string; taskId: string; projectPath?: str
 
 	const existingSession = runtimeState.sessions[task.id] ?? null;
 	const shouldStartSession = !existingSession || existingSession.state !== "running";
+	// If a session already existed (state was running, idle, failed, interrupted,
+	// awaiting_review) and we are restarting it, ask the agent to resume its
+	// previous chat history instead of starting from scratch. Agents without a
+	// `resumeArgs` entry in the catalog ignore the flag silently. See
+	// `.plan/docs/fork-server-side-auto-review.md`.
+	const shouldResume = existingSession !== null;
 
 	if (shouldStartSession) {
 		const ensured = await runtimeClient.workspace.ensureWorktree.mutate({
@@ -712,6 +718,7 @@ async function startTask(input: { cwd: string; taskId: string; projectPath?: str
 			baseRef: task.baseRef,
 			agentId: task.agentId,
 			clineSettings: task.clineSettings,
+			resume: shouldResume,
 		});
 		if (!started.ok || !started.summary) {
 			throw new Error(started.error ?? "Could not start task session.");

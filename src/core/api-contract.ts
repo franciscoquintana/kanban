@@ -994,6 +994,14 @@ export const runtimeTaskSessionStartRequestSchema = z.object({
 	startInPlanMode: z.boolean().optional(),
 	mode: runtimeTaskSessionModeSchema.optional(),
 	resumeFromTrash: z.boolean().optional(),
+	/**
+	 * If true, the agent process is launched with its resume args (when defined
+	 * in the agent catalog) so it picks up the existing chat history for the
+	 * task's worktree instead of starting a fresh conversation. Used for
+	 * relaunching a task whose previous agent process died (e.g. after a
+	 * kanban server restart). See `.plan/docs/fork-server-side-auto-review.md`.
+	 */
+	resume: z.boolean().optional(),
 	baseRef: z.string(),
 	cols: z.number().int().positive().optional(),
 	rows: z.number().int().positive().optional(),
