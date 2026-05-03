@@ -203,6 +203,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 	// `.plan/docs/fork-server-side-auto-review.md`.
 	void resumeInProgressTasksOnBoot({
 		workspaceRegistry: deps.workspaceRegistry,
+		ensureTerminalManagerForWorkspace: deps.ensureTerminalManagerForWorkspace,
 	}).catch((err) => {
 		logError("[auto-resume] top-level pass failed", err);
 	});

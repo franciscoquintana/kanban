@@ -20,7 +20,11 @@
 //
 // See `.plan/docs/fork-server-side-auto-review.md`.
 
-import { loadWorkspaceBoardById, loadWorkspaceSessionsById } from "../state/workspace-state.js";
+import {
+	listWorkspaceIndexEntries,
+	loadWorkspaceBoardById,
+	loadWorkspaceSessionsById,
+} from "../state/workspace-state.js";
 import { resolveAgentCommand } from "../terminal/agent-registry.js";
 import type { TerminalSessionManager } from "../terminal/session-manager.js";
 import { getTaskWorkspacePathInfo } from "../workspace/task-worktree.js";
@@ -40,7 +44,12 @@ function delay(ms: number): Promise<void> {
 }
 
 export interface ResumeInProgressTasksDeps {
-	workspaceRegistry: Pick<WorkspaceRegistry, "listManagedWorkspaces" | "loadScopedRuntimeConfig">;
+	workspaceRegistry: Pick<WorkspaceRegistry, "loadScopedRuntimeConfig">;
+	// Forces creation of the per-workspace terminal manager (which spawns
+	// per-task agent processes). Workspaces are loaded lazily by kanban; for
+	// auto-resume we need to ensure the manager exists for every workspace
+	// that has in_progress work even if the user hasn't navigated there yet.
+	ensureTerminalManagerForWorkspace: (workspaceId: string, repoPath: string) => Promise<TerminalSessionManager>;
 }
 
 /**
@@ -59,29 +68,31 @@ export async function resumeInProgressTasksOnBoot(deps: ResumeInProgressTasksDep
 		return;
 	}
 
-	const workspaces = deps.workspaceRegistry.listManagedWorkspaces();
-	if (workspaces.length === 0) {
+	// Use the persisted workspace index, not just the workspaces currently
+	// managed in memory. At boot the registry is empty until something (the
+	// browser, a CLI command) touches a workspace; we want to scan everything
+	// that was ever registered.
+	const entries = await listWorkspaceIndexEntries();
+	if (entries.length === 0) {
 		return;
 	}
 
 	let totalCandidates = 0;
 
-	for (const ws of workspaces) {
-		if (!ws.workspacePath) {
-			continue;
-		}
+	for (const entry of entries) {
 		try {
+			const terminalManager = await deps.ensureTerminalManagerForWorkspace(entry.workspaceId, entry.repoPath);
 			await resumeWorkspace({
-				workspaceId: ws.workspaceId,
-				workspacePath: ws.workspacePath,
-				terminalManager: ws.terminalManager,
+				workspaceId: entry.workspaceId,
+				workspacePath: entry.repoPath,
+				terminalManager,
 				loadScopedRuntimeConfig: deps.workspaceRegistry.loadScopedRuntimeConfig,
 				onCandidateCount: (count) => {
 					totalCandidates += count;
 				},
 			});
 		} catch (err) {
-			logError(`[auto-resume] workspace ${ws.workspaceId} failed`, err);
+			logError(`[auto-resume] workspace ${entry.workspaceId} failed`, err);
 		}
 	}
 
