@@ -2,12 +2,15 @@ import type { DropResult } from "@hello-pangea/dnd";
 import type { Dispatch, SetStateAction } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { notifyError, showAppToast } from "@/components/app-toaster";
-import type { TaskGitAction } from "@/git-actions/build-task-git-action-prompt";
 import { useLinkedBacklogTaskActions } from "@/hooks/use-linked-backlog-task-actions";
 import { useProgrammaticCardMoves } from "@/hooks/use-programmatic-card-moves";
 import { useReviewAutoActions } from "@/hooks/use-review-auto-actions";
 import type { UseTaskSessionsResult } from "@/hooks/use-task-sessions";
-import type { RuntimeTaskSessionSummary, RuntimeTaskWorkspaceInfoResponse } from "@/runtime/types";
+import type {
+	RuntimeStateStreamAutoActionPendingMessage,
+	RuntimeTaskSessionSummary,
+	RuntimeTaskWorkspaceInfoResponse,
+} from "@/runtime/types";
 import {
 	applyDragResult,
 	clearColumnTasks,
@@ -27,11 +30,6 @@ import {
 	hasPromptedForBrowserNotificationPermission,
 	requestBrowserNotificationPermission,
 } from "@/utils/notification-permission";
-
-interface TaskGitActionLoadingStateLike {
-	commitSource: string | null;
-	prSource: string | null;
-}
 
 interface SelectedBoardCard {
 	card: BoardCard;
@@ -67,8 +65,10 @@ interface UseBoardInteractionsInput {
 		options?: SendTerminalInputOptions,
 	) => Promise<{ ok: boolean; message?: string }>;
 	readyForReviewNotificationsEnabled: boolean;
-	taskGitActionLoadingByTaskId: Record<string, TaskGitActionLoadingStateLike>;
-	runAutoReviewGitAction: (taskId: string, action: TaskGitAction) => Promise<boolean>;
+	// Forwarded from the runtime state stream; used by `useReviewAutoActions`
+	// to play the local card move animation when the server-side manager
+	// announces an upcoming programmatic move.
+	latestAutoActionPending: RuntimeStateStreamAutoActionPendingMessage | null;
 }
 
 export interface UseBoardInteractionsResult {
@@ -111,8 +111,7 @@ export function useBoardInteractions({
 	fetchTaskWorkspaceInfo,
 	sendTaskSessionInput,
 	readyForReviewNotificationsEnabled,
-	taskGitActionLoadingByTaskId,
-	runAutoReviewGitAction,
+	latestAutoActionPending,
 }: UseBoardInteractionsInput): UseBoardInteractionsResult {
 	const previousSessionsRef = useRef<Record<string, RuntimeTaskSessionSummary>>({});
 	const notificationPermissionPromptInFlightRef = useRef(false);
@@ -523,11 +522,12 @@ export function useBoardInteractions({
 		setRequestMoveTaskToTrashHandler(requestMoveTaskToTrash);
 	}, [requestMoveTaskToTrash, setRequestMoveTaskToTrashHandler]);
 
+	// Auto-review dispatch lives on the server now; this just plays the local
+	// move animation when the server sends `auto_action_pending`.
 	useReviewAutoActions({
 		board,
-		taskGitActionLoadingByTaskId,
-		runAutoReviewGitAction,
-		requestMoveTaskToTrash: requestMoveTaskToTrashWithAnimation,
+		latestAutoActionPending,
+		tryProgrammaticCardMove,
 		resetKey: currentProjectId,
 	});
 

@@ -10,6 +10,28 @@ import type {
 } from "../core/api-contract";
 import { runGit } from "./git-utils";
 
+/**
+ * Resolve the tip commit SHA of a local branch in `repoPath`. Returns `null`
+ * if the branch does not exist locally (e.g. only as a remote-tracking ref).
+ *
+ * Used by the server-side auto-review manager to capture a baseline at arming
+ * time and verify after a commit that the branch advanced — i.e. the
+ * cherry-pick onto `baseRef` actually succeeded. See
+ * `.plan/docs/fork-server-side-auto-review.md`.
+ */
+export async function getBranchTip(repoPath: string, baseRef: string): Promise<string | null> {
+	const trimmed = baseRef.trim();
+	if (!trimmed) {
+		return null;
+	}
+	const result = await runGit(repoPath, ["rev-parse", "--verify", "--quiet", `refs/heads/${trimmed}^{commit}`]);
+	if (!result.ok) {
+		return null;
+	}
+	const sha = result.stdout.trim();
+	return sha.length > 0 ? sha : null;
+}
+
 interface GitPathFingerprint {
 	path: string;
 	size: number | null;

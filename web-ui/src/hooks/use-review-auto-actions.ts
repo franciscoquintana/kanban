@@ -1,252 +1,96 @@
-import { useCallback, useEffect, useRef } from "react";
+// In this fork, server-side auto-review (`src/server/server-auto-review-manager.ts`)
+// owns the dispatch of auto-commit and auto-trash. The frontend hook below is
+// a pure observer: when the server announces an upcoming programmatic move
+// via the `auto_action_pending` WebSocket message, the hook plays the local
+// card animation so the move is smooth in the UI rather than a hard jump.
+//
+// Manual UI buttons (Commit / Open PR / Move to Trash on each card) keep using
+// `runAutoReviewGitAction` and `requestMoveTaskToTrashWithAnimation` directly
+// from `use-git-actions.ts` and `use-board-interactions.ts` — those are
+// untouched.
+//
+// See `.plan/docs/fork-server-side-auto-review.md`.
+import { useEffect, useRef } from "react";
 
-import type { TaskGitAction } from "@/git-actions/build-task-git-action-prompt";
-import { findCardSelection } from "@/state/board-state";
-import { getTaskWorkspaceSnapshot, subscribeToAnyTaskMetadata } from "@/stores/workspace-metadata-store";
-import type { BoardCard, BoardColumnId, BoardData, TaskAutoReviewMode } from "@/types";
-import { resolveTaskAutoReviewMode } from "@/types";
+import type { RuntimeStateStreamAutoActionPendingMessage } from "@/runtime/types";
+import type { BoardColumnId, BoardData } from "@/types";
 
-const AUTO_REVIEW_ACTION_DELAY_MS = 500;
-
-function isTaskAutoReviewEnabled(task: BoardCard): boolean {
-	return task.autoReviewEnabled === true;
-}
-
-interface TaskGitActionLoadingStateLike {
-	commitSource: string | null;
-	prSource: string | null;
-}
-
-interface RequestMoveTaskToTrashOptions {
+interface ProgrammaticCardMoveBehavior {
+	insertAtTop?: boolean;
 	skipWorkingChangeWarning?: boolean;
 }
 
 interface UseReviewAutoActionsOptions {
 	board: BoardData;
-	taskGitActionLoadingByTaskId: Record<string, TaskGitActionLoadingStateLike>;
-	runAutoReviewGitAction: (taskId: string, action: TaskGitAction) => Promise<boolean>;
-	requestMoveTaskToTrash: (
+	latestAutoActionPending: RuntimeStateStreamAutoActionPendingMessage | null;
+	tryProgrammaticCardMove: (
 		taskId: string,
 		fromColumnId: BoardColumnId,
-		options?: RequestMoveTaskToTrashOptions,
-	) => Promise<void>;
+		targetColumnId: BoardColumnId,
+		behavior?: ProgrammaticCardMoveBehavior,
+	) => "started" | "blocked" | "unavailable";
 	resetKey?: string | null;
 }
 
 export function useReviewAutoActions({
 	board,
-	taskGitActionLoadingByTaskId,
-	runAutoReviewGitAction,
-	requestMoveTaskToTrash,
+	latestAutoActionPending,
+	tryProgrammaticCardMove,
 	resetKey,
 }: UseReviewAutoActionsOptions): void {
 	const boardRef = useRef<BoardData>(board);
-	const runAutoReviewGitActionRef = useRef(runAutoReviewGitAction);
-	const requestMoveTaskToTrashRef = useRef(requestMoveTaskToTrash);
-	const awaitingCleanActionByTaskIdRef = useRef<Record<string, TaskGitAction>>({});
-	const timerByTaskIdRef = useRef<Record<string, number>>({});
-	type ScheduledAutoReviewAction = TaskAutoReviewMode | "move_to_done_after_git_action";
-	const scheduledActionByTaskIdRef = useRef<Record<string, ScheduledAutoReviewAction>>({});
-	const moveToTrashInFlightTaskIdsRef = useRef<Set<string>>(new Set());
+	const tryProgrammaticCardMoveRef = useRef(tryProgrammaticCardMove);
+	// Track which auto-action payload identities we've already animated. The
+	// stream stores the latest message in state, so without this guard a
+	// re-render would re-trigger the animation.
+	const lastHandledRef = useRef<RuntimeStateStreamAutoActionPendingMessage | null>(null);
 
 	useEffect(() => {
 		boardRef.current = board;
 	}, [board]);
 
 	useEffect(() => {
-		runAutoReviewGitActionRef.current = runAutoReviewGitAction;
-	}, [runAutoReviewGitAction]);
+		tryProgrammaticCardMoveRef.current = tryProgrammaticCardMove;
+	}, [tryProgrammaticCardMove]);
 
 	useEffect(() => {
-		requestMoveTaskToTrashRef.current = requestMoveTaskToTrash;
-	}, [requestMoveTaskToTrash]);
+		// Reset memory when switching projects (or whenever the caller bumps the key).
+		lastHandledRef.current = null;
+	}, [resetKey]);
 
-	const clearAutoReviewTimer = useCallback((taskId: string) => {
-		const timer = timerByTaskIdRef.current[taskId];
-		if (typeof timer === "number") {
-			window.clearTimeout(timer);
+	useEffect(() => {
+		if (!latestAutoActionPending) {
+			return;
 		}
-		delete timerByTaskIdRef.current[taskId];
-		delete scheduledActionByTaskIdRef.current[taskId];
-	}, []);
-
-	const clearAllAutoReviewState = useCallback(() => {
-		for (const timer of Object.values(timerByTaskIdRef.current)) {
-			window.clearTimeout(timer);
+		if (lastHandledRef.current === latestAutoActionPending) {
+			return;
 		}
-		awaitingCleanActionByTaskIdRef.current = {};
-		timerByTaskIdRef.current = {};
-		scheduledActionByTaskIdRef.current = {};
-		moveToTrashInFlightTaskIdsRef.current.clear();
-	}, []);
+		lastHandledRef.current = latestAutoActionPending;
 
-	const scheduleAutoReviewAction = useCallback(
-		(taskId: string, action: ScheduledAutoReviewAction, execute: () => void) => {
-			const existingTimer = timerByTaskIdRef.current[taskId];
-			const existingAction = scheduledActionByTaskIdRef.current[taskId];
-			if (typeof existingTimer === "number" && existingAction === action) {
-				return;
-			}
-			if (typeof existingTimer === "number") {
-				window.clearTimeout(existingTimer);
-			}
-			scheduledActionByTaskIdRef.current[taskId] = action;
-			timerByTaskIdRef.current[taskId] = window.setTimeout(() => {
-				delete timerByTaskIdRef.current[taskId];
-				delete scheduledActionByTaskIdRef.current[taskId];
-				execute();
-			}, AUTO_REVIEW_ACTION_DELAY_MS);
-		},
-		[],
-	);
+		if (latestAutoActionPending.action !== "move_to_trash") {
+			return;
+		}
 
-	useEffect(() => {
-		return () => {
-			clearAllAutoReviewState();
-		};
-	}, [clearAllAutoReviewState]);
+		const taskId = latestAutoActionPending.taskId;
+		const fromColumnId = latestAutoActionPending.fromColumnId;
 
-	useEffect(() => {
-		clearAllAutoReviewState();
-	}, [clearAllAutoReviewState, resetKey]);
+		// Defensive sanity check: only animate when the card is still in the
+		// expected source column locally. If the local board is already past
+		// it (race) we just skip — the upcoming workspace_state_updated will
+		// still settle the visual state.
+		const stillInSource = boardRef.current.columns
+			.find((column) => column.id === fromColumnId)
+			?.cards.some((card) => card.id === taskId);
+		if (!stillInSource) {
+			return;
+		}
 
-	const evaluateAutoReview = useCallback(
-		(_trigger: { source: string; taskId?: string }) => {
-			const columnByTaskId = new Map<string, BoardColumnId>();
-			const reviewCardsForAutomation: BoardCard[] = [];
-			for (const column of boardRef.current.columns) {
-				for (const card of column.cards) {
-					columnByTaskId.set(card.id, column.id);
-					if (column.id === "review") {
-						reviewCardsForAutomation.push(card);
-					}
-				}
-			}
-
-			for (const taskId of Object.keys(awaitingCleanActionByTaskIdRef.current)) {
-				const columnId = columnByTaskId.get(taskId);
-				if (!columnId || columnId === "trash") {
-					delete awaitingCleanActionByTaskIdRef.current[taskId];
-					clearAutoReviewTimer(taskId);
-					moveToTrashInFlightTaskIdsRef.current.delete(taskId);
-				}
-			}
-
-			for (const taskId of moveToTrashInFlightTaskIdsRef.current) {
-				if (columnByTaskId.get(taskId) !== "review") {
-					moveToTrashInFlightTaskIdsRef.current.delete(taskId);
-				}
-			}
-
-			const reviewTaskIds = new Set(reviewCardsForAutomation.map((card) => card.id));
-			for (const taskId of Object.keys(timerByTaskIdRef.current)) {
-				if (!reviewTaskIds.has(taskId)) {
-					clearAutoReviewTimer(taskId);
-				}
-			}
-
-			for (const reviewTask of reviewCardsForAutomation) {
-				const autoReviewEnabled = isTaskAutoReviewEnabled(reviewTask);
-				if (!autoReviewEnabled) {
-					delete awaitingCleanActionByTaskIdRef.current[reviewTask.id];
-					clearAutoReviewTimer(reviewTask.id);
-					continue;
-				}
-
-				const autoReviewMode = resolveTaskAutoReviewMode(reviewTask.autoReviewMode);
-				const loadingState = taskGitActionLoadingByTaskId[reviewTask.id];
-				const isGitActionInFlight =
-					autoReviewMode === "commit"
-						? loadingState?.commitSource !== null && loadingState?.commitSource !== undefined
-						: autoReviewMode === "pr"
-							? loadingState?.prSource !== null && loadingState?.prSource !== undefined
-							: false;
-
-				// Commit/PR automation mental model:
-				// - A task is only "armed" for auto-done after we actually see working changes in review and trigger commit/pr.
-				// - Review entries with zero changes (common during start-in-plan-mode planning loops) are intentionally ignored.
-				// - Once armed, a later review state with zero changes is treated as commit/pr success, then we auto-move to done.
-				const changedFiles = getTaskWorkspaceSnapshot(reviewTask.id)?.changedFiles;
-				const awaitingAction = awaitingCleanActionByTaskIdRef.current[reviewTask.id] ?? null;
-				if (awaitingAction) {
-					if (
-						changedFiles === 0 &&
-						!isGitActionInFlight &&
-						!moveToTrashInFlightTaskIdsRef.current.has(reviewTask.id)
-					) {
-						scheduleAutoReviewAction(reviewTask.id, "move_to_done_after_git_action", () => {
-							const latestSelection = findCardSelection(boardRef.current, reviewTask.id);
-							if (!latestSelection || latestSelection.column.id !== "review") {
-								return;
-							}
-							if (!isTaskAutoReviewEnabled(latestSelection.card)) {
-								return;
-							}
-							const latestMode = resolveTaskAutoReviewMode(latestSelection.card.autoReviewMode);
-							if (latestMode !== autoReviewMode) {
-								return;
-							}
-							moveToTrashInFlightTaskIdsRef.current.add(reviewTask.id);
-							void requestMoveTaskToTrashRef
-								.current(reviewTask.id, "review", {
-									skipWorkingChangeWarning: true,
-								})
-								.finally(() => {
-									delete awaitingCleanActionByTaskIdRef.current[reviewTask.id];
-									moveToTrashInFlightTaskIdsRef.current.delete(reviewTask.id);
-								});
-						});
-					} else {
-						clearAutoReviewTimer(reviewTask.id);
-					}
-					continue;
-				}
-
-				if ((changedFiles ?? 0) <= 0 || isGitActionInFlight) {
-					clearAutoReviewTimer(reviewTask.id);
-					continue;
-				}
-
-				scheduleAutoReviewAction(reviewTask.id, autoReviewMode, () => {
-					const latestSelection = findCardSelection(boardRef.current, reviewTask.id);
-					if (!latestSelection || latestSelection.column.id !== "review") {
-						return;
-					}
-					if (!isTaskAutoReviewEnabled(latestSelection.card)) {
-						return;
-					}
-					const latestMode = resolveTaskAutoReviewMode(latestSelection.card.autoReviewMode);
-					if (latestMode !== autoReviewMode) {
-						return;
-					}
-					awaitingCleanActionByTaskIdRef.current[reviewTask.id] = latestMode;
-					void runAutoReviewGitActionRef.current(reviewTask.id, latestMode).then((triggered) => {
-						if (!triggered && awaitingCleanActionByTaskIdRef.current[reviewTask.id] === latestMode) {
-							delete awaitingCleanActionByTaskIdRef.current[reviewTask.id];
-						}
-					});
-				});
-			}
-		},
-		[clearAutoReviewTimer, scheduleAutoReviewAction, taskGitActionLoadingByTaskId],
-	);
-
-	useEffect(() => {
-		evaluateAutoReview({
-			source: "board_or_loading_change",
+		// "blocked" / "unavailable" both mean the dnd context isn't ready or
+		// another programmatic move is in flight. Either way we skip — the
+		// state update from the server still reaches the board.
+		tryProgrammaticCardMoveRef.current(taskId, fromColumnId, "trash", {
+			insertAtTop: true,
+			skipWorkingChangeWarning: true,
 		});
-	}, [board, evaluateAutoReview, taskGitActionLoadingByTaskId]);
-
-	useEffect(() => {
-		return subscribeToAnyTaskMetadata((taskId) => {
-			const selection = findCardSelection(boardRef.current, taskId);
-			if (!selection || selection.column.id !== "review") {
-				return;
-			}
-			evaluateAutoReview({
-				source: "task_metadata_store",
-				taskId,
-			});
-		});
-	}, [evaluateAutoReview]);
+	}, [latestAutoActionPending]);
 }

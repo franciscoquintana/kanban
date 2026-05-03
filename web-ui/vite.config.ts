@@ -88,6 +88,8 @@ export default defineConfig({
 			"@runtime-task-title": resolve(__dirname, "../src/core/task-title.ts"),
 			"@runtime-task-worktree-path": resolve(__dirname, "../src/workspace/task-worktree-path.ts"),
 			"@runtime-task-state": resolve(__dirname, "../src/core/task-board-mutations.ts"),
+			"@runtime-git-action-prompt": resolve(__dirname, "../src/git-actions/build-task-git-action-prompt.ts"),
+			"@runtime-native-agent": resolve(__dirname, "../src/runtime/native-agent.ts"),
 		},
 	},
 	server: {

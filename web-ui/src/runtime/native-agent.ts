@@ -1,15 +1,13 @@
 import { isRuntimeAgentLaunchSupported } from "@runtime-agent-catalog";
+import { isNativeClineAgentSelected } from "@runtime-native-agent";
 import type {
-	RuntimeAgentId,
 	RuntimeClineProviderSettings,
 	RuntimeConfigResponse,
 	RuntimeStateStreamTaskChatMessage,
 	RuntimeTaskChatMessage,
 } from "@/runtime/types";
 
-export function isNativeClineAgentSelected(agentId: RuntimeAgentId | null | undefined): boolean {
-	return agentId === "cline";
-}
+export { isNativeClineAgentSelected };
 
 export function getRuntimeClineProviderSettings(
 	config: Pick<RuntimeConfigResponse, "clineProviderSettings"> | null | undefined,
