@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import { createHTTPHandler } from "@trpc/server/adapters/standalone";
 import { handleClineMcpOauthCallback } from "../cline-sdk/cline-mcp-runtime-service";
+import { createClineProviderService } from "../cline-sdk/cline-provider-service";
 import {
 	type ClineTaskSessionService,
 	createInMemoryClineTaskSessionService,
@@ -37,6 +38,7 @@ import {
 	validateSession,
 } from "../security/passcode-manager";
 import { loadWorkspaceContextById } from "../state/workspace-state";
+import { buildRuntimeConfigResponse } from "../terminal/agent-registry";
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import { createTerminalWebSocketBridge } from "../terminal/ws-server";
 import { type RuntimeTrpcContext, type RuntimeTrpcWorkspaceScope, runtimeAppRouter } from "../trpc/app-router";
@@ -47,6 +49,7 @@ import { createWorkspaceApi } from "../trpc/workspace-api";
 import { getWebUiDir, normalizeRequestPath, readAsset } from "./assets";
 import { handleHttpRequest, handleSocketUpgrade } from "./middleware";
 import type { RuntimeStateHub } from "./runtime-state-hub";
+import { createServerAutoReviewManager, type ServerAutoReviewManager } from "./server-auto-review-manager";
 import type { WorkspaceRegistry } from "./workspace-registry";
 
 interface DisposeTrackedWorkspaceResult {
@@ -57,6 +60,7 @@ interface DisposeTrackedWorkspaceResult {
 export interface CreateRuntimeServerDependencies {
 	workspaceRegistry: WorkspaceRegistry;
 	runtimeStateHub: RuntimeStateHub;
+	autoReviewManagerRef: { current: ServerAutoReviewManager | null };
 	warn: (message: string) => void;
 	ensureTerminalManagerForWorkspace: (workspaceId: string, repoPath: string) => Promise<TerminalSessionManager>;
 	resolveInteractiveShellCommand: () => { binary: string; args: string[] };
@@ -167,6 +171,30 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 	const disposeClineTaskSessionService = (workspaceId: string): void => {
 		void disposeClineTaskSessionServiceAsync(workspaceId);
 	};
+	// Instantiate the server-side auto-review manager. It needs access to:
+	// - the cline session services map (above) for the "cline native" delivery path
+	// - the workspace's terminal manager for the "terminal paste" path
+	// - a runtime-config loader (for commit prompt templates) — built here from
+	//   the scoped runtime-config loader plus a fresh provider service.
+	// See `.plan/docs/fork-server-side-auto-review.md`.
+	const autoReviewProviderService = createClineProviderService();
+	const serverAutoReviewManager = createServerAutoReviewManager({
+		getTerminalManagerForWorkspace: deps.workspaceRegistry.getTerminalManagerForWorkspace,
+		getClineTaskSessionServiceForWorkspace: (workspaceId) =>
+			clineTaskSessionServiceByWorkspaceId.get(workspaceId) ?? null,
+		getRuntimeConfigForWorkspace: async (workspaceId) => {
+			const workspacePath = deps.workspaceRegistry.getWorkspacePathById(workspaceId);
+			if (!workspacePath) {
+				throw new Error(`Workspace ${workspaceId} is not registered, cannot load runtime config`);
+			}
+			const state = await deps.workspaceRegistry.loadScopedRuntimeConfig({ workspaceId, workspacePath });
+			return buildRuntimeConfigResponse(state, autoReviewProviderService.getProviderSettingsSummary());
+		},
+		broadcastRuntimeWorkspaceStateUpdated: deps.runtimeStateHub.broadcastRuntimeWorkspaceStateUpdated,
+		broadcastAutoActionPending: deps.runtimeStateHub.broadcastAutoActionPending,
+	});
+	deps.autoReviewManagerRef.current = serverAutoReviewManager;
+
 	const prepareForStateReset = async (): Promise<void> => {
 		const workspaceIds = new Set<string>();
 		for (const { workspaceId } of deps.workspaceRegistry.listManagedWorkspaces()) {
@@ -496,6 +524,8 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 	return {
 		url,
 		close: async () => {
+			serverAutoReviewManager.close();
+			deps.autoReviewManagerRef.current = null;
 			await Promise.all(
 				Array.from(clineTaskSessionServiceByWorkspaceId.values()).map(async (service) => {
 					await service.dispose();

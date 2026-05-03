@@ -106,6 +106,7 @@ export default function App(): ReactElement {
 		latestTaskChatMessage,
 		taskChatMessagesByTaskId,
 		latestTaskReadyForReview,
+		latestAutoActionPending,
 		latestMcpAuthStatuses,
 		clineSessionContextVersion,
 		streamError,
@@ -363,7 +364,6 @@ export default function App(): ReactElement {
 
 	const {
 		runningGitAction,
-		taskGitActionLoadingByTaskId,
 		commitTaskLoadingById,
 		openPrTaskLoadingById,
 		agentCommitTaskLoadingById,
@@ -380,7 +380,6 @@ export default function App(): ReactElement {
 		handleOpenPrTask,
 		handleAgentCommitTask,
 		handleAgentOpenPrTask,
-		runAutoReviewGitAction,
 		resetGitActionState,
 	} = useGitActions({
 		currentProjectId,
@@ -595,8 +594,7 @@ export default function App(): ReactElement {
 		fetchTaskWorkspaceInfo,
 		sendTaskSessionInput,
 		readyForReviewNotificationsEnabled,
-		taskGitActionLoadingByTaskId,
-		runAutoReviewGitAction,
+		latestAutoActionPending,
 	});
 
 	const {

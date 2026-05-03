@@ -3,6 +3,7 @@ import { useEffect, useReducer } from "react";
 import type {
 	RuntimeClineMcpServerAuthStatus,
 	RuntimeProjectSummary,
+	RuntimeStateStreamAutoActionPendingMessage,
 	RuntimeStateStreamClineSessionContextUpdatedMessage,
 	RuntimeStateStreamMcpAuthUpdatedMessage,
 	RuntimeStateStreamMessage,
@@ -54,6 +55,10 @@ export interface UseRuntimeStateStreamResult {
 	latestTaskChatMessage: RuntimeStateStreamTaskChatMessage | null;
 	taskChatMessagesByTaskId: Record<string, RuntimeTaskChatMessage[]>;
 	latestTaskReadyForReview: RuntimeStateStreamTaskReadyForReviewMessage | null;
+	// Sent by the server right before it executes a programmatic move so the
+	// frontend can play its move animation in sync with the upcoming
+	// workspace_state_updated. See `.plan/docs/fork-server-side-auto-review.md`.
+	latestAutoActionPending: RuntimeStateStreamAutoActionPendingMessage | null;
 	latestMcpAuthStatuses: RuntimeClineMcpServerAuthStatus[] | null;
 	clineSessionContextVersion: number;
 	streamError: string | null;
@@ -69,6 +74,7 @@ interface RuntimeStateStreamStore {
 	latestTaskChatMessage: RuntimeStateStreamTaskChatMessage | null;
 	taskChatMessagesByTaskId: Record<string, RuntimeTaskChatMessage[]>;
 	latestTaskReadyForReview: RuntimeStateStreamTaskReadyForReviewMessage | null;
+	latestAutoActionPending: RuntimeStateStreamAutoActionPendingMessage | null;
 	latestMcpAuthStatuses: RuntimeClineMcpServerAuthStatus[] | null;
 	clineSessionContextVersion: number;
 	streamError: string | null;
@@ -89,6 +95,7 @@ type RuntimeStateStreamAction =
 	| { type: "task_chat_cleared"; payload: RuntimeStateStreamTaskChatClearedMessage }
 	| { type: "workspace_metadata_updated"; workspaceMetadata: RuntimeWorkspaceMetadata }
 	| { type: "task_ready_for_review"; payload: RuntimeStateStreamTaskReadyForReviewMessage }
+	| { type: "auto_action_pending"; payload: RuntimeStateStreamAutoActionPendingMessage }
 	| { type: "mcp_auth_updated"; payload: RuntimeStateStreamMcpAuthUpdatedMessage }
 	| { type: "cline_session_context_updated"; payload: RuntimeStateStreamClineSessionContextUpdatedMessage }
 	| { type: "workspace_state_updated"; workspaceState: RuntimeWorkspaceStateResponse }
@@ -105,6 +112,7 @@ function createInitialRuntimeStateStreamStore(requestedWorkspaceId: string | nul
 		latestTaskChatMessage: null,
 		taskChatMessagesByTaskId: {},
 		latestTaskReadyForReview: null,
+		latestAutoActionPending: null,
 		latestMcpAuthStatuses: null,
 		clineSessionContextVersion: 0,
 		streamError: null,
@@ -189,6 +197,7 @@ function runtimeStateStreamReducer(
 			latestTaskChatMessage: null,
 			taskChatMessagesByTaskId: {},
 			latestTaskReadyForReview: state.latestTaskReadyForReview,
+			latestAutoActionPending: state.latestAutoActionPending,
 			latestMcpAuthStatuses: state.latestMcpAuthStatuses,
 			clineSessionContextVersion: action.payload.clineSessionContextVersion,
 			streamError: null,
@@ -207,6 +216,7 @@ function runtimeStateStreamReducer(
 			latestTaskChatMessage: didProjectChange ? null : state.latestTaskChatMessage,
 			taskChatMessagesByTaskId: didProjectChange ? {} : state.taskChatMessagesByTaskId,
 			latestTaskReadyForReview: didProjectChange ? null : state.latestTaskReadyForReview,
+			latestAutoActionPending: didProjectChange ? null : state.latestAutoActionPending,
 			hasReceivedSnapshot: true,
 		};
 	}
@@ -235,6 +245,12 @@ function runtimeStateStreamReducer(
 		return {
 			...state,
 			workspaceMetadata: action.workspaceMetadata,
+		};
+	}
+	if (action.type === "auto_action_pending") {
+		return {
+			...state,
+			latestAutoActionPending: action.payload,
 		};
 	}
 	if (action.type === "task_ready_for_review") {
@@ -445,6 +461,16 @@ export function useRuntimeStateStream(requestedWorkspaceId: string | null): UseR
 						});
 						return;
 					}
+					if (payload.type === "auto_action_pending") {
+						if (payload.workspaceId !== activeWorkspaceId) {
+							return;
+						}
+						dispatch({
+							type: "auto_action_pending",
+							payload,
+						});
+						return;
+					}
 					if (payload.type === "mcp_auth_updated") {
 						dispatch({
 							type: "mcp_auth_updated",
@@ -509,6 +535,7 @@ export function useRuntimeStateStream(requestedWorkspaceId: string | null): UseR
 		latestTaskChatMessage: state.latestTaskChatMessage,
 		taskChatMessagesByTaskId: state.taskChatMessagesByTaskId,
 		latestTaskReadyForReview: state.latestTaskReadyForReview,
+		latestAutoActionPending: state.latestAutoActionPending,
 		latestMcpAuthStatuses: state.latestMcpAuthStatuses,
 		clineSessionContextVersion: state.clineSessionContextVersion,
 		streamError: state.streamError,

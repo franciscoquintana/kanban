@@ -33,6 +33,7 @@ import {
 import { disablePasscode, generateInternalToken, generatePasscode } from "./security/passcode-manager";
 import { terminateProcessForTimeout } from "./server/process-termination";
 import type { RuntimeStateHub } from "./server/runtime-state-hub";
+import type { ServerAutoReviewManager } from "./server/server-auto-review-manager";
 import { captureNodeException, flushNodeTelemetry } from "./telemetry/sentry-node.js";
 import type { TerminalSessionManager } from "./terminal/session-manager";
 import { runOnDemandUpdate } from "./update/update";
@@ -407,6 +408,11 @@ async function startServer(): Promise<{
 		import("./update/update.js"),
 	]);
 	let runtimeStateHub: RuntimeStateHub | undefined;
+	// Lazy ref filled in inside createRuntimeServer (the manager needs access
+	// to the cline session services map that lives there). The hub captures
+	// the ref so its metadata-monitor callbacks can reach the manager once
+	// it is constructed. See `.plan/docs/fork-server-side-auto-review.md`.
+	const autoReviewManagerRef: { current: ServerAutoReviewManager | null } = { current: null };
 	const workspaceRegistry = await createWorkspaceRegistry({
 		cwd: process.cwd(),
 		loadGlobalRuntimeConfig,
@@ -419,6 +425,7 @@ async function startServer(): Promise<{
 	});
 	runtimeStateHub = createRuntimeStateHub({
 		workspaceRegistry,
+		autoReviewManagerRef,
 	});
 	const runtimeHub = runtimeStateHub;
 	for (const { workspaceId, terminalManager } of workspaceRegistry.listManagedWorkspaces()) {
@@ -441,6 +448,7 @@ async function startServer(): Promise<{
 	const runtimeServer = await createRuntimeServer({
 		workspaceRegistry,
 		runtimeStateHub: runtimeHub,
+		autoReviewManagerRef,
 		warn: (message) => {
 			console.warn(`[kanban] ${message}`);
 		},

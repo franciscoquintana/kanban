@@ -6,6 +6,7 @@ import { WebSocket, WebSocketServer } from "ws";
 import type { ClineTaskMessage, ClineTaskSessionService } from "../cline-sdk/cline-task-session-service";
 import type {
 	RuntimeClineMcpServerAuthStatus,
+	RuntimeStateStreamAutoActionPendingMessage,
 	RuntimeStateStreamClineSessionContextUpdatedMessage,
 	RuntimeStateStreamErrorMessage,
 	RuntimeStateStreamMcpAuthUpdatedMessage,
@@ -20,7 +21,10 @@ import type {
 	RuntimeStateStreamWorkspaceStateMessage,
 	RuntimeTaskSessionSummary,
 } from "../core/api-contract";
+import { loadWorkspaceBoardById } from "../state/workspace-state";
 import type { TerminalSessionManager } from "../terminal/session-manager";
+import type { AutoActionPendingPayload, ServerAutoReviewManager } from "./server-auto-review-manager";
+import { logError } from "./server-log";
 import { createWorkspaceMetadataMonitor } from "./workspace-metadata-monitor";
 import type { ResolvedWorkspaceStreamTarget, WorkspaceRegistry } from "./workspace-registry";
 
@@ -34,8 +38,14 @@ export interface DisposeRuntimeStateWorkspaceOptions {
 export interface CreateRuntimeStateHubDependencies {
 	workspaceRegistry: Pick<
 		WorkspaceRegistry,
-		"resolveWorkspaceForStream" | "buildProjectsPayload" | "buildWorkspaceStateSnapshot"
+		"resolveWorkspaceForStream" | "buildProjectsPayload" | "buildWorkspaceStateSnapshot" | "getWorkspacePathById"
 	>;
+	// Lazy reference: the auto-review manager is constructed inside
+	// `createRuntimeServer` (it needs access to the cline session services
+	// map that lives there) and assigned to `autoReviewManagerRef.current`
+	// before any metadata polling begins. The hub reads via the ref so we
+	// avoid circular constructor wiring.
+	autoReviewManagerRef?: { current: ServerAutoReviewManager | null };
 }
 
 export interface RuntimeStateHub {
@@ -57,6 +67,7 @@ export interface RuntimeStateHub {
 	broadcastClineMcpAuthStatusesUpdated: (statuses: RuntimeClineMcpServerAuthStatus[]) => void;
 	bumpClineSessionContextVersion: () => void;
 	broadcastTaskReadyForReview: (workspaceId: string, taskId: string) => void;
+	broadcastAutoActionPending: (payload: AutoActionPendingPayload) => void;
 	close: () => Promise<void>;
 }
 
@@ -74,6 +85,11 @@ export function createRuntimeStateHub(deps: CreateRuntimeStateHubDependencies): 
 	const runtimeStateWebSocketServer = new WebSocketServer({ noServer: true });
 	const workspaceMetadataMonitor = createWorkspaceMetadataMonitor({
 		onMetadataUpdated: (workspaceId, workspaceMetadata) => {
+			// Always notify the server-side auto-review manager so it keeps a
+			// fresh view of changedFiles / headCommit even when no browser is
+			// connected. Has to come BEFORE the early-return below.
+			deps.autoReviewManagerRef?.current?.onWorkspaceMetadataUpdated(workspaceId, workspaceMetadata);
+
 			const clients = runtimeStateClientsByWorkspaceId.get(workspaceId);
 			if (!clients || clients.size === 0) {
 				return;
@@ -298,31 +314,62 @@ export function createRuntimeStateHub(deps: CreateRuntimeStateHubDependencies): 
 	};
 
 	const broadcastRuntimeWorkspaceStateUpdated = async (workspaceId: string, workspacePath: string): Promise<void> => {
-		const clients = runtimeStateClientsByWorkspaceId.get(workspaceId);
-		if (!clients || clients.size === 0) {
-			return;
-		}
+		// Build the snapshot regardless of clients, because the metadata
+		// monitor and the auto-review manager need to know about board moves
+		// (e.g. tasks dragged out of review) even with no UI connected.
 		try {
 			const workspaceState = await deps.workspaceRegistry.buildWorkspaceStateSnapshot(workspaceId, workspacePath);
-			const payload: RuntimeStateStreamWorkspaceStateMessage = {
-				type: "workspace_state_updated",
-				workspaceId,
-				workspaceState,
-			};
-			for (const client of clients) {
-				sendRuntimeStateMessage(client, payload);
+			const clients = runtimeStateClientsByWorkspaceId.get(workspaceId);
+			if (clients && clients.size > 0) {
+				const payload: RuntimeStateStreamWorkspaceStateMessage = {
+					type: "workspace_state_updated",
+					workspaceId,
+					workspaceState,
+				};
+				for (const client of clients) {
+					sendRuntimeStateMessage(client, payload);
+				}
 			}
 			await workspaceMetadataMonitor.updateWorkspaceState({
 				workspaceId,
 				workspacePath,
 				board: workspaceState.board,
 			});
+			deps.autoReviewManagerRef?.current?.onWorkspaceStateUpdated(workspaceId, workspaceState.board);
 		} catch {
 			// Ignore transient state read failures; next update will resync.
 		}
 	};
 
 	const broadcastTaskReadyForReview = (workspaceId: string, taskId: string) => {
+		// Register with the server-side auto-review manager regardless of
+		// connected clients. The manager looks up the task's autoReview
+		// settings from the persisted board.
+		const manager = deps.autoReviewManagerRef?.current;
+		if (manager) {
+			void (async () => {
+				try {
+					const board = await loadWorkspaceBoardById(workspaceId);
+					const card = board.columns.flatMap((col) => col.cards).find((c) => c.id === taskId);
+					if (card?.autoReviewEnabled === true) {
+						const workspacePath = deps.workspaceRegistry.getWorkspacePathById(workspaceId);
+						if (workspacePath) {
+							manager.registerTaskForAutoReview({
+								workspaceId,
+								workspacePath,
+								taskId,
+								baseRef: card.baseRef,
+								autoReviewMode: card.autoReviewMode ?? "commit",
+							});
+						}
+					}
+				} catch (err) {
+					// Best-effort registration. Auto-review manager is optional.
+					logError(`[runtime-state-hub] auto-review registration failed for task ${taskId}:`, err);
+				}
+			})();
+		}
+
 		const runtimeClients = runtimeStateClientsByWorkspaceId.get(workspaceId);
 		if (!runtimeClients || runtimeClients.size === 0) {
 			return;
@@ -332,6 +379,23 @@ export function createRuntimeStateHub(deps: CreateRuntimeStateHubDependencies): 
 			workspaceId,
 			taskId,
 			triggeredAt: Date.now(),
+		};
+		for (const client of runtimeClients) {
+			sendRuntimeStateMessage(client, payload);
+		}
+	};
+
+	const broadcastAutoActionPending = (input: AutoActionPendingPayload) => {
+		const runtimeClients = runtimeStateClientsByWorkspaceId.get(input.workspaceId);
+		if (!runtimeClients || runtimeClients.size === 0) {
+			return;
+		}
+		const payload: RuntimeStateStreamAutoActionPendingMessage = {
+			type: "auto_action_pending",
+			workspaceId: input.workspaceId,
+			taskId: input.taskId,
+			fromColumnId: input.fromColumnId,
+			action: input.action,
 		};
 		for (const client of runtimeClients) {
 			sendRuntimeStateMessage(client, payload);
@@ -552,6 +616,7 @@ export function createRuntimeStateHub(deps: CreateRuntimeStateHubDependencies): 
 		broadcastClineMcpAuthStatusesUpdated,
 		bumpClineSessionContextVersion,
 		broadcastTaskReadyForReview,
+		broadcastAutoActionPending,
 		close: async () => {
 			for (const timer of taskSessionBroadcastTimersByWorkspaceId.values()) {
 				clearTimeout(timer);

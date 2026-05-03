@@ -1,12 +1,17 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { TaskGitAction } from "@/git-actions/build-task-git-action-prompt";
 import { useReviewAutoActions } from "@/hooks/use-review-auto-actions";
-import { resetWorkspaceMetadataStore, setTaskWorkspaceSnapshot } from "@/stores/workspace-metadata-store";
-import type { BoardColumnId, BoardData, ReviewTaskWorkspaceSnapshot } from "@/types";
+import type { RuntimeStateStreamAutoActionPendingMessage } from "@/runtime/types";
+import type { BoardColumnId, BoardData } from "@/types";
 
-function createBoard(autoReviewEnabled: boolean): BoardData {
+// In this fork the auto-review dispatch lives on the server. The hook we test
+// here is a pure observer: when the server announces an upcoming programmatic
+// move via `auto_action_pending`, the hook should play the local move
+// animation by calling `tryProgrammaticCardMove`. See
+// `.plan/docs/fork-server-side-auto-review.md`.
+
+function createBoard(): BoardData {
 	return {
 		columns: [
 			{ id: "backlog", title: "Backlog", cards: [] },
@@ -20,7 +25,7 @@ function createBoard(autoReviewEnabled: boolean): BoardData {
 						title: "Test task",
 						prompt: "Test task",
 						startInPlanMode: false,
-						autoReviewEnabled,
+						autoReviewEnabled: true,
 						autoReviewMode: "commit",
 						baseRef: "main",
 						createdAt: 1,
@@ -34,34 +39,33 @@ function createBoard(autoReviewEnabled: boolean): BoardData {
 	};
 }
 
-const workspaceSnapshots: Record<string, ReviewTaskWorkspaceSnapshot> = {
-	"task-1": {
-		taskId: "task-1",
-		path: "/tmp/task-1",
-		branch: "task-1",
-		isDetached: false,
-		headCommit: "abc123",
-		changedFiles: 3,
-		additions: 10,
-		deletions: 2,
-	},
-};
+function autoActionPending(taskId: string): RuntimeStateStreamAutoActionPendingMessage {
+	return {
+		type: "auto_action_pending",
+		workspaceId: "ws-1",
+		taskId,
+		fromColumnId: "review",
+		action: "move_to_trash",
+	};
+}
 
 function HookHarness({
 	board,
-	runAutoReviewGitAction,
-	requestMoveTaskToTrash,
+	latestAutoActionPending,
+	tryProgrammaticCardMove,
 }: {
 	board: BoardData;
-	runAutoReviewGitAction: (taskId: string, action: TaskGitAction) => Promise<boolean>;
-	requestMoveTaskToTrash: (taskId: string, fromColumnId: BoardColumnId) => Promise<void>;
+	latestAutoActionPending: RuntimeStateStreamAutoActionPendingMessage | null;
+	tryProgrammaticCardMove: (
+		taskId: string,
+		fromColumnId: BoardColumnId,
+		targetColumnId: BoardColumnId,
+	) => "started" | "blocked" | "unavailable";
 }): null {
-	setTaskWorkspaceSnapshot(workspaceSnapshots["task-1"] ?? null);
 	useReviewAutoActions({
 		board,
-		taskGitActionLoadingByTaskId: {},
-		runAutoReviewGitAction,
-		requestMoveTaskToTrash,
+		latestAutoActionPending,
+		tryProgrammaticCardMove,
 	});
 	return null;
 }
@@ -72,7 +76,6 @@ describe("useReviewAutoActions", () => {
 	let previousActEnvironment: boolean | undefined;
 
 	beforeEach(() => {
-		vi.useFakeTimers();
 		previousActEnvironment = (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean })
 			.IS_REACT_ACT_ENVIRONMENT;
 		(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -85,7 +88,6 @@ describe("useReviewAutoActions", () => {
 		act(() => {
 			root.unmount();
 		});
-		resetWorkspaceMetadataStore();
 		container.remove();
 		if (previousActEnvironment === undefined) {
 			delete (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT;
@@ -93,38 +95,87 @@ describe("useReviewAutoActions", () => {
 			(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT =
 				previousActEnvironment;
 		}
-		vi.useRealTimers();
 	});
 
-	it("cancels a scheduled auto review action when autoReviewEnabled is turned off", async () => {
-		const runAutoReviewGitAction = vi.fn(async () => true);
-		const requestMoveTaskToTrash = vi.fn(async () => {});
-
-		await act(async () => {
+	it("does not call tryProgrammaticCardMove when no auto-action message has arrived", () => {
+		const tryProgrammaticCardMove = vi.fn().mockReturnValue("started" as const);
+		act(() => {
 			root.render(
 				<HookHarness
-					board={createBoard(true)}
-					runAutoReviewGitAction={runAutoReviewGitAction}
-					requestMoveTaskToTrash={requestMoveTaskToTrash}
+					board={createBoard()}
+					latestAutoActionPending={null}
+					tryProgrammaticCardMove={tryProgrammaticCardMove}
 				/>,
 			);
 		});
+		expect(tryProgrammaticCardMove).not.toHaveBeenCalled();
+	});
 
-		await act(async () => {
+	it("plays the move animation when auto_action_pending arrives for a task in review", () => {
+		const tryProgrammaticCardMove = vi.fn().mockReturnValue("started" as const);
+		const message = autoActionPending("task-1");
+		act(() => {
 			root.render(
 				<HookHarness
-					board={createBoard(false)}
-					runAutoReviewGitAction={runAutoReviewGitAction}
-					requestMoveTaskToTrash={requestMoveTaskToTrash}
+					board={createBoard()}
+					latestAutoActionPending={message}
+					tryProgrammaticCardMove={tryProgrammaticCardMove}
 				/>,
 			);
 		});
+		expect(tryProgrammaticCardMove).toHaveBeenCalledTimes(1);
+		expect(tryProgrammaticCardMove).toHaveBeenCalledWith(
+			"task-1",
+			"review",
+			"trash",
+			expect.objectContaining({ insertAtTop: true, skipWorkingChangeWarning: true }),
+		);
+	});
 
-		await act(async () => {
-			vi.advanceTimersByTime(1000);
+	it("does not re-trigger the animation on re-render with the same payload identity", () => {
+		const tryProgrammaticCardMove = vi.fn().mockReturnValue("started" as const);
+		const message = autoActionPending("task-1");
+		act(() => {
+			root.render(
+				<HookHarness
+					board={createBoard()}
+					latestAutoActionPending={message}
+					tryProgrammaticCardMove={tryProgrammaticCardMove}
+				/>,
+			);
 		});
+		act(() => {
+			root.render(
+				<HookHarness
+					board={createBoard()}
+					latestAutoActionPending={message}
+					tryProgrammaticCardMove={tryProgrammaticCardMove}
+				/>,
+			);
+		});
+		expect(tryProgrammaticCardMove).toHaveBeenCalledTimes(1);
+	});
 
-		expect(runAutoReviewGitAction).not.toHaveBeenCalled();
-		expect(requestMoveTaskToTrash).not.toHaveBeenCalled();
+	it("skips the animation when the task is no longer in the source column", () => {
+		const tryProgrammaticCardMove = vi.fn().mockReturnValue("started" as const);
+		const board: BoardData = {
+			columns: [
+				{ id: "backlog", title: "Backlog", cards: [] },
+				{ id: "in_progress", title: "In Progress", cards: [] },
+				{ id: "review", title: "Review", cards: [] },
+				{ id: "trash", title: "Done", cards: [] },
+			],
+			dependencies: [],
+		};
+		act(() => {
+			root.render(
+				<HookHarness
+					board={board}
+					latestAutoActionPending={autoActionPending("task-1")}
+					tryProgrammaticCardMove={tryProgrammaticCardMove}
+				/>,
+			);
+		});
+		expect(tryProgrammaticCardMove).not.toHaveBeenCalled();
 	});
 });

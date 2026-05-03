@@ -424,6 +424,21 @@ export type RuntimeStateStreamTaskReadyForReviewMessage = z.infer<
 	typeof runtimeStateStreamTaskReadyForReviewMessageSchema
 >;
 
+// Sent by the server-side auto-review manager just before it executes a
+// programmatic move on a card. Lets a connected frontend trigger its local
+// move animation in sync with the upcoming workspace_state_updated. See
+// `.plan/docs/fork-server-side-auto-review.md`.
+export const runtimeStateStreamAutoActionPendingMessageSchema = z.object({
+	type: z.literal("auto_action_pending"),
+	workspaceId: z.string(),
+	taskId: z.string(),
+	fromColumnId: runtimeBoardColumnIdSchema,
+	action: z.enum(["move_to_trash"]),
+});
+export type RuntimeStateStreamAutoActionPendingMessage = z.infer<
+	typeof runtimeStateStreamAutoActionPendingMessageSchema
+>;
+
 export const runtimeStateStreamTaskChatMessageSchema = z.object({
 	type: z.literal("task_chat_message"),
 	workspaceId: z.string(),
@@ -466,6 +481,7 @@ export const runtimeStateStreamMessageSchema = z.discriminatedUnion("type", [
 	runtimeStateStreamProjectsMessageSchema,
 	runtimeStateStreamWorkspaceMetadataMessageSchema,
 	runtimeStateStreamTaskReadyForReviewMessageSchema,
+	runtimeStateStreamAutoActionPendingMessageSchema,
 	runtimeStateStreamTaskChatMessageSchema,
 	runtimeStateStreamTaskChatClearedMessageSchema,
 	runtimeStateStreamMcpAuthUpdatedMessageSchema,
