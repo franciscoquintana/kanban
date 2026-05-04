@@ -96,10 +96,13 @@ the agent has already heard. The user types whatever they want next.
 
 `src/server/auto-resume-on-boot.ts` runs once after the runtime server has
 finished wiring. For every managed workspace it scans the persisted board
-plus sessions; for each task in the `in_progress` column whose session
-record is **not** in `running` state, it spawns the agent with
-`resume: true` and an empty prompt. Spawns are staggered by 500 ms to avoid
-a thundering-herd of agent processes.
+plus sessions; for each task in `in_progress` or `review` with a session
+record, it spawns the agent with `resume: true` and an empty prompt. Spawns
+are staggered by 500 ms to avoid a thundering-herd of agent processes.
+
+(`backlog` and `done` are intentionally excluded — backlog tasks have never
+run and `claude --continue` would fail with "No conversations to continue";
+done tasks no longer need an agent.)
 
 **Filter — claude only.** Tasks whose effective agent (per-card override →
 last summary → workspace default) is not `claude` are skipped with a log
