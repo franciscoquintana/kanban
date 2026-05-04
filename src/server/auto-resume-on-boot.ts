@@ -112,16 +112,19 @@ interface ResumeWorkspaceInput {
 async function resumeWorkspace(input: ResumeWorkspaceInput): Promise<void> {
 	const board = await loadWorkspaceBoardById(input.workspaceId);
 	const sessions = await loadWorkspaceSessionsById(input.workspaceId);
-	const inProgressColumn = board.columns.find((column) => column.id === "in_progress");
-	if (!inProgressColumn) {
-		return;
-	}
-	const candidates = inProgressColumn.cards.filter((card) => {
+	// Resume agents for tasks in either `in_progress` or `review`. Tasks in
+	// review may still need their agent alive for follow-up edits or to drive
+	// the auto-commit pipeline; backlog/done are intentionally excluded.
+	const resumableColumns = new Set<string>(["in_progress", "review"]);
+	const allCards = board.columns
+		.filter((column) => resumableColumns.has(column.id))
+		.flatMap((column) => column.cards);
+	const candidates = allCards.filter((card) => {
 		// At boot time, any process kanban spawned in its previous lifetime is
 		// dead (children of a parent process that no longer exists). The
 		// persisted `state` field in sessions.json is therefore stale —
 		// including the "running" entries. Trust the column position instead:
-		// a card in `in_progress` with any session record needs respawn.
+		// any card in `in_progress`/`review` with a session record needs respawn.
 		// Cards without a session record (clean board) are skipped because
 		// `claude --continue` would fail with "No conversations to continue".
 		return sessions[card.id] !== undefined;
