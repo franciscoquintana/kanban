@@ -129,7 +129,6 @@ export function useBoardInteractions({
 		waitForProgrammaticCardMoveAvailability,
 		resetProgrammaticCardMoves,
 		requestMoveTaskToTrashWithAnimation,
-		programmaticCardMoveCycle,
 	} = useProgrammaticCardMoves();
 
 	const resolvePendingProgrammaticStartMove = useCallback((taskId: string, started: boolean) => {
@@ -435,81 +434,43 @@ export function useBoardInteractions({
 	);
 
 	useEffect(() => {
+		// In this fork the column moves driven by session state changes
+		// (awaiting_review→review, running→in_progress, interrupted→trash)
+		// happen server-side via the auto-review-manager + hooks-api. The
+		// frontend only animates them via `auto_action_pending` broadcasts.
+		// See `.plan/docs/fork-server-side-auto-review.md`.
+		//
+		// We still maintain `previousSessionsRef` so detail-pane logic that
+		// peeks at the prior state works. We also still update the selected
+		// task pointer when the previously-selected card disappears so the
+		// UI doesn't end up pointing at nothing.
 		setBoard((currentBoard) => {
-			let nextBoard = currentBoard;
 			const previousSessions = previousSessionsRef.current;
-			const blockedInterruptedTaskIds = new Set<string>();
 			for (const summary of Object.values(sessions)) {
 				const previous = previousSessions[summary.taskId];
 				if (previous && previous.updatedAt > summary.updatedAt) {
 					continue;
 				}
-				const columnId = getTaskColumnId(nextBoard, summary.taskId);
-				if (summary.state === "awaiting_review" && columnId === "in_progress") {
-					const programmaticMoveAttempt = tryProgrammaticCardMove(summary.taskId, columnId, "review");
-					if (programmaticMoveAttempt === "started" || programmaticMoveAttempt === "blocked") {
-						continue;
-					}
-					const moved = moveTaskToColumn(nextBoard, summary.taskId, "review", { insertAtTop: true });
-					if (moved.moved) {
-						nextBoard = moved.board;
-					}
-					continue;
-				}
-				if (summary.state === "running" && columnId === "review") {
-					const programmaticMoveAttempt = tryProgrammaticCardMove(summary.taskId, columnId, "in_progress", {
-						skipKickoff: true,
-					});
-					if (programmaticMoveAttempt === "started" || programmaticMoveAttempt === "blocked") {
-						continue;
-					}
-					const moved = moveTaskToColumn(nextBoard, summary.taskId, "in_progress", { insertAtTop: true });
-					if (moved.moved) {
-						nextBoard = moved.board;
-					}
-					continue;
-				}
+				const columnId = getTaskColumnId(currentBoard, summary.taskId);
 				if (
 					summary.state === "interrupted" &&
 					previous?.state !== "interrupted" &&
 					columnId &&
 					columnId !== "trash"
 				) {
-					const nextTaskId = getNextDetailTaskIdAfterTrashMove(nextBoard, summary.taskId);
-					const programmaticMoveAttempt = tryProgrammaticCardMove(summary.taskId, columnId, "trash", {
-						skipTrashWorkflow: true,
-					});
-					if (programmaticMoveAttempt === "started" || programmaticMoveAttempt === "blocked") {
-						if (programmaticMoveAttempt === "blocked") {
-							blockedInterruptedTaskIds.add(summary.taskId);
-						}
-						setSelectedTaskId((currentSelectedTaskId) =>
-							currentSelectedTaskId === summary.taskId ? nextTaskId : currentSelectedTaskId,
-						);
-						continue;
-					}
-					const moved = moveTaskToColumn(nextBoard, summary.taskId, "trash", { insertAtTop: true });
-					if (moved.moved) {
-						setSelectedTaskId((currentSelectedTaskId) =>
-							currentSelectedTaskId === summary.taskId ? nextTaskId : currentSelectedTaskId,
-						);
-						nextBoard = moved.board;
-					}
+					// Server will move it to trash; we just shift selection so
+					// the detail panel doesn't keep showing a card on its way
+					// out.
+					const nextTaskId = getNextDetailTaskIdAfterTrashMove(currentBoard, summary.taskId);
+					setSelectedTaskId((currentSelectedTaskId) =>
+						currentSelectedTaskId === summary.taskId ? nextTaskId : currentSelectedTaskId,
+					);
 				}
 			}
-			const nextPreviousSessions = { ...sessions };
-			for (const taskId of blockedInterruptedTaskIds) {
-				const previousSession = previousSessions[taskId];
-				if (previousSession) {
-					nextPreviousSessions[taskId] = previousSession;
-					continue;
-				}
-				delete nextPreviousSessions[taskId];
-			}
-			previousSessionsRef.current = nextPreviousSessions;
-			return nextBoard;
+			previousSessionsRef.current = { ...sessions };
+			return currentBoard;
 		});
-	}, [programmaticCardMoveCycle, sessions, setBoard, setSelectedTaskId, tryProgrammaticCardMove]);
+	}, [sessions, setBoard, setSelectedTaskId]);
 
 	const { confirmMoveTaskToTrash, handleCreateDependency, handleDeleteDependency, requestMoveTaskToTrash } =
 		useLinkedBacklogTaskActions({

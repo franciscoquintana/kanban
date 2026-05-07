@@ -194,6 +194,8 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		},
 		broadcastRuntimeWorkspaceStateUpdated: deps.runtimeStateHub.broadcastRuntimeWorkspaceStateUpdated,
 		broadcastAutoActionPending: deps.runtimeStateHub.broadcastAutoActionPending,
+		subscribeWorkspaceMetadataMonitor: deps.runtimeStateHub.subscribeWorkspaceMetadataMonitor,
+		unsubscribeWorkspaceMetadataMonitor: deps.runtimeStateHub.unsubscribeWorkspaceMetadataMonitor,
 	});
 	deps.autoReviewManagerRef.current = serverAutoReviewManager;
 
