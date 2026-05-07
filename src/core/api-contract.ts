@@ -433,7 +433,7 @@ export const runtimeStateStreamAutoActionPendingMessageSchema = z.object({
 	workspaceId: z.string(),
 	taskId: z.string(),
 	fromColumnId: runtimeBoardColumnIdSchema,
-	action: z.enum(["move_to_trash"]),
+	action: z.enum(["move_to_trash", "move_to_review", "move_to_in_progress"]),
 });
 export type RuntimeStateStreamAutoActionPendingMessage = z.infer<
 	typeof runtimeStateStreamAutoActionPendingMessageSchema

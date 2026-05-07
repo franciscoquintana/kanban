@@ -116,9 +116,7 @@ async function resumeWorkspace(input: ResumeWorkspaceInput): Promise<void> {
 	// review may still need their agent alive for follow-up edits or to drive
 	// the auto-commit pipeline; backlog/done are intentionally excluded.
 	const resumableColumns = new Set<string>(["in_progress", "review"]);
-	const allCards = board.columns
-		.filter((column) => resumableColumns.has(column.id))
-		.flatMap((column) => column.cards);
+	const allCards = board.columns.filter((column) => resumableColumns.has(column.id)).flatMap((column) => column.cards);
 	const candidates = allCards.filter((card) => {
 		// At boot time, any process kanban spawned in its previous lifetime is
 		// dead (children of a parent process that no longer exists). The

@@ -15,6 +15,13 @@ export interface CreateHooksApiDependencies {
 	ensureTerminalManagerForWorkspace: (workspaceId: string, repoPath: string) => Promise<TerminalSessionManager>;
 	broadcastRuntimeWorkspaceStateUpdated: (workspaceId: string, workspacePath: string) => Promise<void> | void;
 	broadcastTaskReadyForReview: (workspaceId: string, taskId: string) => void;
+	// Server-side counterparts of the upstream frontend auto-move logic
+	// (use-board-interactions.ts). With these in place the column moves
+	// happen regardless of browser presence. The frontend, when connected,
+	// receives `auto_action_pending` first and plays the animation in sync.
+	// See `.plan/docs/fork-server-side-auto-review.md`.
+	moveTaskInProgressToReview?: (workspaceId: string, workspacePath: string, taskId: string) => Promise<void>;
+	moveTaskReviewToInProgress?: (workspaceId: string, workspacePath: string, taskId: string) => Promise<void>;
 	captureTaskTurnCheckpoint?: (input: {
 		cwd: string;
 		taskId: string;
@@ -115,6 +122,24 @@ export function createHooksApi(deps: CreateHooksApiDependencies): RuntimeTrpcCon
 				void deps.broadcastRuntimeWorkspaceStateUpdated(workspaceId, workspacePath);
 				if (event === "to_review") {
 					deps.broadcastTaskReadyForReview(workspaceId, taskId);
+					// Move the card from in_progress → review on the persisted board
+					// so the transition works regardless of browser presence. The
+					// manager broadcasts auto_action_pending first so a connected
+					// frontend can play the animation in sync.
+					if (deps.moveTaskInProgressToReview) {
+						void deps.moveTaskInProgressToReview(workspaceId, workspacePath, taskId).catch(() => {
+							// Best effort; manager logs its own errors.
+						});
+					}
+				} else if (event === "to_in_progress") {
+					// Inverse: when a previously-paused task is resumed (session
+					// state running), move the card review → in_progress. This is
+					// the equivalent of `use-board-interactions.ts:459` upstream.
+					if (deps.moveTaskReviewToInProgress) {
+						void deps.moveTaskReviewToInProgress(workspaceId, workspacePath, taskId).catch(() => {
+							// Best effort.
+						});
+					}
 				}
 
 				return { ok: true } satisfies RuntimeHookIngestResponse;

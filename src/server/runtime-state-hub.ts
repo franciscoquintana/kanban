@@ -335,7 +335,7 @@ export function createRuntimeStateHub(deps: CreateRuntimeStateHubDependencies): 
 				workspacePath,
 				board: workspaceState.board,
 			});
-			deps.autoReviewManagerRef?.current?.onWorkspaceStateUpdated(workspaceId, workspaceState.board);
+			deps.autoReviewManagerRef?.current?.onWorkspaceStateUpdated(workspaceId, workspacePath, workspaceState.board);
 		} catch {
 			// Ignore transient state read failures; next update will resync.
 		}

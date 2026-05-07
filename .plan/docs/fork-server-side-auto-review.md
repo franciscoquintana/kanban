@@ -304,6 +304,31 @@ Pending submission. If accepted, this doc and the entire fork can be retired.
 - Build output verified: `npm run build` produces a valid `dist/cli.js` and
   `dist/web-ui/` with the new code.
 
+## Known issues to investigate (not yet fixed)
+
+- **WebSocket broadcast saturation under heavy concurrent agent output.**
+  When several tasks are running long-output commands at once (e.g. pytest
+  with verbose output, multiple MCP servers, bash loops), the kanban web
+  UI does not deliver agent stdout/stderr in real time — it buffers and
+  then dumps a chunk every few seconds. Symptom: a card looks "stuck"
+  for minutes, then suddenly shows everything that happened in one
+  splash. Confirmed in 2026-05 with 6 concurrent in_progress claude
+  tasks on a single workspace. Likely culprits to look at:
+  - `src/terminal/ws-server.ts` — terminal output stream from the
+    pty to the browser xterm.
+  - `runtime-state-hub.ts` `TASK_SESSION_STREAM_BATCH_MS = 150` —
+    batches summaries but not raw output.
+  - `workspace-metadata-monitor` polling every 1s with 6+ worktrees
+    on heavy disk activity.
+
+  Possible mitigations: per-session output throttling with backpressure,
+  more aggressive batching of raw terminal frames, drop-intermediate
+  policy when the client write queue grows. Frontend side: RAF-throttle
+  the xterm write so the UI can keep up.
+
+  Not blocking — agents continue to make progress; only the visualisation
+  is delayed.
+
 ## Authorship / history
 
 - Fork created from `cline/kanban@fabf453 v0.1.67` on 2026-05-03.

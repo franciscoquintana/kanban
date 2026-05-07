@@ -68,8 +68,8 @@ interface PendingEntry {
 export interface AutoActionPendingPayload {
 	workspaceId: string;
 	taskId: string;
-	fromColumnId: "review";
-	action: "move_to_trash";
+	fromColumnId: "review" | "in_progress";
+	action: "move_to_trash" | "move_to_review" | "move_to_in_progress";
 }
 
 export interface CreateServerAutoReviewManagerDependencies {
@@ -90,8 +90,10 @@ export interface RegisterTaskForAutoReviewParams {
 
 export interface ServerAutoReviewManager {
 	registerTaskForAutoReview(params: RegisterTaskForAutoReviewParams): void;
+	moveTaskInProgressToReview(workspaceId: string, workspacePath: string, taskId: string): Promise<void>;
+	moveTaskReviewToInProgress(workspaceId: string, workspacePath: string, taskId: string): Promise<void>;
 	onWorkspaceMetadataUpdated(workspaceId: string, metadata: RuntimeWorkspaceMetadata): void;
-	onWorkspaceStateUpdated(workspaceId: string, board: RuntimeBoardData): void;
+	onWorkspaceStateUpdated(workspaceId: string, workspacePath: string, board: RuntimeBoardData): void;
 	close(): void;
 }
 
@@ -405,29 +407,59 @@ export function createServerAutoReviewManager(
 		}
 	}
 
-	function onWorkspaceStateUpdated(workspaceId: string, board: RuntimeBoardData): void {
-		// Drop entries for tasks that have left the review column (manually
-		// moved, deleted, etc.) so we don't keep stale registrations.
-		const reviewIds = new Set<string>();
+	function onWorkspaceStateUpdated(workspaceId: string, workspacePath: string, board: RuntimeBoardData): void {
+		// Source of truth = current column position. The to_review hook from
+		// the agent only flips the session state machine; it does NOT move
+		// the card. The card transitions into review when:
+		//   - a user drags it, or
+		//   - a programmatic move is triggered (frontend / future server).
+		// Because of that, registering on the hook can race the card-move
+		// (we'd register, then a state-update fires the OLD board with the
+		// card still in in_progress, and we'd unregister immediately).
+		//
+		// So we treat the column as authoritative: a card present in `review`
+		// with autoReviewEnabled gets a pending entry; a card no longer in
+		// `review` gets dropped. Simple, idempotent, race-free.
+		const reviewCardsById = new Map<string, RuntimeBoardData["columns"][number]["cards"][number]>();
 		for (const column of board.columns) {
 			if (column.id !== "review") {
 				continue;
 			}
 			for (const card of column.cards) {
-				reviewIds.add(card.id);
+				reviewCardsById.set(card.id, card);
 			}
 		}
+
+		// Register cards now in review with autoReviewEnabled.
+		for (const [taskId, card] of reviewCardsById) {
+			if (pendingByTaskId.has(taskId)) {
+				continue;
+			}
+			if (card.autoReviewEnabled !== true) {
+				continue;
+			}
+			registerTaskForAutoReview({
+				workspaceId,
+				workspacePath,
+				taskId,
+				baseRef: card.baseRef,
+				autoReviewMode: card.autoReviewMode ?? "commit",
+			});
+		}
+
+		// Drop tracked tasks that have left the review column.
 		for (const [taskId, entry] of pendingByTaskId) {
 			if (entry.workspaceId !== workspaceId) {
 				continue;
 			}
-			if (!reviewIds.has(taskId)) {
-				clearTimer(entry);
-				pendingByTaskId.delete(taskId);
-				latestMetadataByTaskId.delete(taskId);
-				releaseSlot(entry.baseRef, taskId);
-				logInfo(`${logTag(taskId, entry.baseRef)} no longer in review, unregistering`);
+			if (reviewCardsById.has(taskId)) {
+				continue;
 			}
+			clearTimer(entry);
+			pendingByTaskId.delete(taskId);
+			latestMetadataByTaskId.delete(taskId);
+			releaseSlot(entry.baseRef, taskId);
+			logInfo(`${logTag(taskId, entry.baseRef)} no longer in review, unregistering`);
 		}
 	}
 
@@ -441,13 +473,62 @@ export function createServerAutoReviewManager(
 		queueByBaseRef.clear();
 	}
 
-	// Reference the `moveTaskToColumn` import so future revisions of the trash
-	// flow (e.g. moving without dependency relinking) have a single import to
-	// migrate to. Currently we use `trashTaskAndGetReadyLinkedTaskIds`.
-	void moveTaskToColumn;
+	/**
+	 * Move a task's card between columns on the persisted board, with a
+	 * pre-move `auto_action_pending` broadcast so connected frontends can
+	 * play the move animation in sync with the upcoming
+	 * `workspace_state_updated`. The mutation happens regardless of browser
+	 * presence, so the transition works browser-independently.
+	 *
+	 * Used as the server-side counterpart of the upstream frontend logic in
+	 * `web-ui/src/hooks/use-board-interactions.ts` that watches the session
+	 * state machine and shuffles cards. See
+	 * `.plan/docs/fork-server-side-auto-review.md`.
+	 */
+	async function moveCard(
+		workspaceId: string,
+		workspacePath: string,
+		taskId: string,
+		fromColumnId: AutoActionPendingPayload["fromColumnId"],
+		action: AutoActionPendingPayload["action"],
+		targetColumnId: "review" | "in_progress" | "trash",
+	): Promise<void> {
+		try {
+			deps.broadcastAutoActionPending({ workspaceId, taskId, fromColumnId, action });
+			// Yield briefly so any connected frontend can start its animation
+			// before the actual saveState lands.
+			await new Promise<void>((resolve) => setTimeout(resolve, MOVE_ANIMATION_GRACE_MS));
+
+			const result = await mutateWorkspaceState<{ moved: boolean }>(workspacePath, (latestState) => {
+				const moved = moveTaskToColumn(latestState.board, taskId, targetColumnId, Date.now());
+				if (!moved.moved) {
+					return { board: latestState.board, value: { moved: false }, save: false };
+				}
+				const nextState: RuntimeWorkspaceStateResponse = { ...latestState, board: moved.board };
+				return { board: nextState.board, value: { moved: true } };
+			});
+
+			if (result.saved) {
+				logInfo(`${logTag(taskId, "?")} moved ${fromColumnId} → ${targetColumnId}`);
+				void deps.broadcastRuntimeWorkspaceStateUpdated(workspaceId, workspacePath);
+			}
+		} catch (err) {
+			logError(`${logTag(taskId, "?")} move ${fromColumnId} → ${targetColumnId} failed`, err);
+		}
+	}
+
+	function moveTaskInProgressToReview(workspaceId: string, workspacePath: string, taskId: string): Promise<void> {
+		return moveCard(workspaceId, workspacePath, taskId, "in_progress", "move_to_review", "review");
+	}
+
+	function moveTaskReviewToInProgress(workspaceId: string, workspacePath: string, taskId: string): Promise<void> {
+		return moveCard(workspaceId, workspacePath, taskId, "review", "move_to_in_progress", "in_progress");
+	}
 
 	return {
 		registerTaskForAutoReview,
+		moveTaskInProgressToReview,
+		moveTaskReviewToInProgress,
 		onWorkspaceMetadataUpdated,
 		onWorkspaceStateUpdated,
 		close,
