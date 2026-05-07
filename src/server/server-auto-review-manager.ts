@@ -36,7 +36,7 @@ import type {
 import { moveTaskToColumn, trashTaskAndGetReadyLinkedTaskIds } from "../core/task-board-mutations.js";
 import { buildTaskGitActionPrompt, type TaskGitAction } from "../git-actions/build-task-git-action-prompt.js";
 import { isNativeClineAgentSelected } from "../runtime/native-agent.js";
-import { mutateWorkspaceState } from "../state/workspace-state.js";
+import { loadWorkspaceBoardById, mutateWorkspaceState } from "../state/workspace-state.js";
 import type { TerminalSessionManager } from "../terminal/session-manager.js";
 import { getBranchTip } from "../workspace/git-sync.js";
 import { logError, logInfo, logWarn } from "./server-log.js";
@@ -78,6 +78,14 @@ export interface CreateServerAutoReviewManagerDependencies {
 	getRuntimeConfigForWorkspace: (workspaceId: string) => Promise<RuntimeConfigResponse>;
 	broadcastRuntimeWorkspaceStateUpdated: (workspaceId: string, workspacePath: string) => Promise<void> | void;
 	broadcastAutoActionPending: (payload: AutoActionPendingPayload) => void;
+	// Bumps the workspace-metadata-monitor's subscriber count so it polls
+	// `git status` even when no browser is connected. Without this, the
+	// monitor only polls while a client is subscribed, which means
+	// `onWorkspaceMetadataUpdated` never fires and auto-commit can never
+	// trigger server-side. The manager balances each subscribe with an
+	// unsubscribe when it has no more pending tasks for that workspace.
+	subscribeWorkspaceMetadataMonitor: (workspaceId: string, workspacePath: string) => Promise<void> | void;
+	unsubscribeWorkspaceMetadataMonitor: (workspaceId: string) => void;
 }
 
 export interface RegisterTaskForAutoReviewParams {
@@ -92,6 +100,7 @@ export interface ServerAutoReviewManager {
 	registerTaskForAutoReview(params: RegisterTaskForAutoReviewParams): void;
 	moveTaskInProgressToReview(workspaceId: string, workspacePath: string, taskId: string): Promise<void>;
 	moveTaskReviewToInProgress(workspaceId: string, workspacePath: string, taskId: string): Promise<void>;
+	moveInterruptedTaskToTrash(workspaceId: string, workspacePath: string, taskId: string): Promise<void>;
 	onWorkspaceMetadataUpdated(workspaceId: string, metadata: RuntimeWorkspaceMetadata): void;
 	onWorkspaceStateUpdated(workspaceId: string, workspacePath: string, board: RuntimeBoardData): void;
 	close(): void;
@@ -123,6 +132,34 @@ export function createServerAutoReviewManager(
 	// Serialisation slots:
 	const inFlightByBaseRef = new Map<string, string>(); // baseRef -> taskId
 	const queueByBaseRef = new Map<string, string[]>(); // baseRef -> [taskIds]
+	// Per-workspace count of pending entries. Used to subscribe / unsubscribe
+	// the metadata monitor so it keeps polling git status even when no
+	// browser is connected. Each entry is one task currently armed-or-pending.
+	const subscriptionCountByWorkspaceId = new Map<string, number>();
+	const subscribedWorkspacePaths = new Map<string, string>();
+
+	function acquireMetadataSubscription(workspaceId: string, workspacePath: string): void {
+		const previous = subscriptionCountByWorkspaceId.get(workspaceId) ?? 0;
+		subscriptionCountByWorkspaceId.set(workspaceId, previous + 1);
+		subscribedWorkspacePaths.set(workspaceId, workspacePath);
+		if (previous === 0) {
+			void Promise.resolve(deps.subscribeWorkspaceMetadataMonitor(workspaceId, workspacePath)).catch((err) => {
+				logError(`[ServerAutoReview] subscribe metadata monitor failed for ${workspaceId}`, err);
+			});
+		}
+	}
+
+	function releaseMetadataSubscription(workspaceId: string): void {
+		const previous = subscriptionCountByWorkspaceId.get(workspaceId) ?? 0;
+		const next = Math.max(0, previous - 1);
+		if (next === 0) {
+			subscriptionCountByWorkspaceId.delete(workspaceId);
+			subscribedWorkspacePaths.delete(workspaceId);
+			deps.unsubscribeWorkspaceMetadataMonitor(workspaceId);
+		} else {
+			subscriptionCountByWorkspaceId.set(workspaceId, next);
+		}
+	}
 
 	function clearTimer(entry: PendingEntry): void {
 		if (entry.actionTimer !== null) {
@@ -288,6 +325,7 @@ export function createServerAutoReviewManager(
 			pendingByTaskId.delete(entry.taskId);
 			latestMetadataByTaskId.delete(entry.taskId);
 			releaseSlot(entry.baseRef, entry.taskId);
+			releaseMetadataSubscription(entry.workspaceId);
 			entry.moveToTrashInFlight = false;
 		}
 	}
@@ -390,6 +428,7 @@ export function createServerAutoReviewManager(
 			moveToTrashInFlight: false,
 		};
 		pendingByTaskId.set(params.taskId, entry);
+		acquireMetadataSubscription(params.workspaceId, params.workspacePath);
 		logInfo(`${logTag(entry.taskId, entry.baseRef)} registered for auto-review (mode=${entry.autoReviewMode})`);
 		void evaluate(entry);
 	}
@@ -459,6 +498,7 @@ export function createServerAutoReviewManager(
 			pendingByTaskId.delete(taskId);
 			latestMetadataByTaskId.delete(taskId);
 			releaseSlot(entry.baseRef, taskId);
+			releaseMetadataSubscription(entry.workspaceId);
 			logInfo(`${logTag(taskId, entry.baseRef)} no longer in review, unregistering`);
 		}
 	}
@@ -471,6 +511,13 @@ export function createServerAutoReviewManager(
 		latestMetadataByTaskId.clear();
 		inFlightByBaseRef.clear();
 		queueByBaseRef.clear();
+		// Release every still-active metadata subscription so the monitor
+		// can stop polling on shutdown.
+		for (const workspaceId of subscriptionCountByWorkspaceId.keys()) {
+			deps.unsubscribeWorkspaceMetadataMonitor(workspaceId);
+		}
+		subscriptionCountByWorkspaceId.clear();
+		subscribedWorkspacePaths.clear();
 	}
 
 	/**
@@ -525,10 +572,61 @@ export function createServerAutoReviewManager(
 		return moveCard(workspaceId, workspacePath, taskId, "review", "move_to_in_progress", "in_progress");
 	}
 
+	/**
+	 * Move a task whose session was just marked `interrupted` to the trash
+	 * column. Mirrors the upstream frontend behaviour. The current column is
+	 * looked up via the persisted board so the broadcast carries the right
+	 * `fromColumnId` for the animation. Linked-task relinking is handled by
+	 * `trashTaskAndGetReadyLinkedTaskIds`.
+	 */
+	async function moveInterruptedTaskToTrash(
+		workspaceId: string,
+		workspacePath: string,
+		taskId: string,
+	): Promise<void> {
+		try {
+			const board = await loadWorkspaceBoardById(workspaceId);
+			let fromColumnId: string | null = null;
+			for (const column of board.columns) {
+				if (column.cards.some((card) => card.id === taskId)) {
+					fromColumnId = column.id;
+					break;
+				}
+			}
+			if (fromColumnId === null || fromColumnId === "trash") {
+				return;
+			}
+			if (fromColumnId === "in_progress" || fromColumnId === "review") {
+				deps.broadcastAutoActionPending({
+					workspaceId,
+					taskId,
+					fromColumnId,
+					action: "move_to_trash",
+				});
+				await new Promise<void>((resolve) => setTimeout(resolve, MOVE_ANIMATION_GRACE_MS));
+			}
+			const result = await mutateWorkspaceState<{ moved: boolean }>(workspacePath, (latestState) => {
+				const trashed = trashTaskAndGetReadyLinkedTaskIds(latestState.board, taskId);
+				if (!trashed.moved) {
+					return { board: latestState.board, value: { moved: false }, save: false };
+				}
+				const nextState: RuntimeWorkspaceStateResponse = { ...latestState, board: trashed.board };
+				return { board: nextState.board, value: { moved: true } };
+			});
+			if (result.saved) {
+				logInfo(`${logTag(taskId, "?")} interrupted → trash (from ${fromColumnId})`);
+				void deps.broadcastRuntimeWorkspaceStateUpdated(workspaceId, workspacePath);
+			}
+		} catch (err) {
+			logError(`${logTag(taskId, "?")} move interrupted → trash failed`, err);
+		}
+	}
+
 	return {
 		registerTaskForAutoReview,
 		moveTaskInProgressToReview,
 		moveTaskReviewToInProgress,
+		moveInterruptedTaskToTrash,
 		onWorkspaceMetadataUpdated,
 		onWorkspaceStateUpdated,
 		close,

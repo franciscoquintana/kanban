@@ -68,6 +68,11 @@ export interface RuntimeStateHub {
 	bumpClineSessionContextVersion: () => void;
 	broadcastTaskReadyForReview: (workspaceId: string, taskId: string) => void;
 	broadcastAutoActionPending: (payload: AutoActionPendingPayload) => void;
+	// Manager-driven subscription to the metadata monitor so polling
+	// continues even when no browser is connected. Each call increments the
+	// monitor's subscriber count for the workspace.
+	subscribeWorkspaceMetadataMonitor: (workspaceId: string, workspacePath: string) => Promise<void>;
+	unsubscribeWorkspaceMetadataMonitor: (workspaceId: string) => void;
 	close: () => Promise<void>;
 }
 
@@ -561,8 +566,30 @@ export function createRuntimeStateHub(deps: CreateRuntimeStateHubDependencies): 
 			if (terminalSummaryUnsubscribeByWorkspaceId.has(workspaceId)) {
 				return;
 			}
+			// Track previous-state per task so we can detect transitions to
+			// `interrupted` and tell the auto-review manager to move the
+			// card to trash server-side (mirrors the upstream frontend
+			// auto-trash on interrupted).
+			const previousByTaskId = new Map<string, RuntimeTaskSessionSummary>();
 			const unsubscribe = manager.onSummary((summary) => {
+				const previous = previousByTaskId.get(summary.taskId);
+				previousByTaskId.set(summary.taskId, summary);
 				queueTaskSessionSummaryBroadcast(workspaceId, summary);
+				if (
+					previous &&
+					previous.state !== "interrupted" &&
+					summary.state === "interrupted" &&
+					deps.autoReviewManagerRef?.current
+				) {
+					const workspacePath = deps.workspaceRegistry.getWorkspacePathById(workspaceId);
+					if (workspacePath) {
+						void deps.autoReviewManagerRef.current
+							.moveInterruptedTaskToTrash(workspaceId, workspacePath, summary.taskId)
+							.catch(() => {
+								// Best effort; manager logs internally.
+							});
+					}
+				}
 			});
 			terminalSummaryUnsubscribeByWorkspaceId.set(workspaceId, unsubscribe);
 		},
@@ -596,6 +623,18 @@ export function createRuntimeStateHub(deps: CreateRuntimeStateHubDependencies): 
 				) {
 					broadcastTaskReadyForReview(workspaceId, summary.taskId);
 				}
+				if (
+					previousSummary &&
+					previousSummary.state !== "interrupted" &&
+					summary.state === "interrupted" &&
+					deps.autoReviewManagerRef?.current
+				) {
+					void deps.autoReviewManagerRef.current
+						.moveInterruptedTaskToTrash(workspaceId, workspacePath, summary.taskId)
+						.catch(() => {
+							// Best effort; manager logs internally.
+						});
+				}
 			});
 			clineSummaryUnsubscribeByWorkspaceId.set(workspaceId, unsubscribe);
 			const unsubscribeMessage = service.onMessage((taskId, message) => {
@@ -617,6 +656,24 @@ export function createRuntimeStateHub(deps: CreateRuntimeStateHubDependencies): 
 		bumpClineSessionContextVersion,
 		broadcastTaskReadyForReview,
 		broadcastAutoActionPending,
+		subscribeWorkspaceMetadataMonitor: async (workspaceId, workspacePath) => {
+			// Build the snapshot to seed the monitor with the current board.
+			// If the read fails, fall back to a connect with an empty board
+			// (the monitor will refresh on the first updateWorkspaceState).
+			try {
+				const workspaceState = await deps.workspaceRegistry.buildWorkspaceStateSnapshot(workspaceId, workspacePath);
+				await workspaceMetadataMonitor.connectWorkspace({
+					workspaceId,
+					workspacePath,
+					board: workspaceState.board,
+				});
+			} catch {
+				// Best-effort. The next state-updated broadcast will refresh.
+			}
+		},
+		unsubscribeWorkspaceMetadataMonitor: (workspaceId) => {
+			workspaceMetadataMonitor.disconnectWorkspace(workspaceId);
+		},
 		close: async () => {
 			for (const timer of taskSessionBroadcastTimersByWorkspaceId.values()) {
 				clearTimeout(timer);
