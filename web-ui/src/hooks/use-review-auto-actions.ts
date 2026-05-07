@@ -67,12 +67,20 @@ export function useReviewAutoActions({
 		}
 		lastHandledRef.current = latestAutoActionPending;
 
-		if (latestAutoActionPending.action !== "move_to_trash") {
-			return;
-		}
-
 		const taskId = latestAutoActionPending.taskId;
 		const fromColumnId = latestAutoActionPending.fromColumnId;
+		// Map server action → target column. Add new cases here as the
+		// `auto_action_pending` schema gains more action types.
+		let toColumnId: BoardColumnId;
+		if (latestAutoActionPending.action === "move_to_trash") {
+			toColumnId = "trash";
+		} else if (latestAutoActionPending.action === "move_to_review") {
+			toColumnId = "review";
+		} else if (latestAutoActionPending.action === "move_to_in_progress") {
+			toColumnId = "in_progress";
+		} else {
+			return;
+		}
 
 		// Defensive sanity check: only animate when the card is still in the
 		// expected source column locally. If the local board is already past
@@ -88,7 +96,7 @@ export function useReviewAutoActions({
 		// "blocked" / "unavailable" both mean the dnd context isn't ready or
 		// another programmatic move is in flight. Either way we skip — the
 		// state update from the server still reaches the board.
-		tryProgrammaticCardMoveRef.current(taskId, fromColumnId, "trash", {
+		tryProgrammaticCardMoveRef.current(taskId, fromColumnId, toColumnId, {
 			insertAtTop: true,
 			skipWorkingChangeWarning: true,
 		});

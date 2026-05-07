@@ -286,6 +286,10 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				ensureTerminalManagerForWorkspace: deps.ensureTerminalManagerForWorkspace,
 				broadcastRuntimeWorkspaceStateUpdated: deps.runtimeStateHub.broadcastRuntimeWorkspaceStateUpdated,
 				broadcastTaskReadyForReview: deps.runtimeStateHub.broadcastTaskReadyForReview,
+				moveTaskInProgressToReview: (workspaceId, workspacePath, taskId) =>
+					serverAutoReviewManager.moveTaskInProgressToReview(workspaceId, workspacePath, taskId),
+				moveTaskReviewToInProgress: (workspaceId, workspacePath, taskId) =>
+					serverAutoReviewManager.moveTaskReviewToInProgress(workspaceId, workspacePath, taskId),
 			}),
 		};
 	};
