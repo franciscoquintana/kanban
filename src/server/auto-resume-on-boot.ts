@@ -112,26 +112,23 @@ interface ResumeWorkspaceInput {
 async function resumeWorkspace(input: ResumeWorkspaceInput): Promise<void> {
 	const board = await loadWorkspaceBoardById(input.workspaceId);
 	const sessions = await loadWorkspaceSessionsById(input.workspaceId);
-	// Resume agents for tasks in either `in_progress` or `review`. Tasks in
-	// review may still need their agent alive for follow-up edits or to drive
-	// the auto-commit pipeline; backlog/done are intentionally excluded.
+	// Process every card in `in_progress` or `review` — both columns imply
+	// "an agent should be alive". `backlog` and `done` are excluded.
+	// We treat cards in two groups:
+	//   - With session record  → resume (claude --continue, empty prompt)
+	//   - Without session record → fresh start (claude with original prompt)
+	// Both groups are necessary: in_progress cards can be either ones whose
+	// agent died after kanban restart (have a summary) or freshly-started
+	// tasks whose first agent never ran yet (no summary, e.g. user clicked
+	// Start while kanban was down).
 	const resumableColumns = new Set<string>(["in_progress", "review"]);
 	const allCards = board.columns.filter((column) => resumableColumns.has(column.id)).flatMap((column) => column.cards);
-	const candidates = allCards.filter((card) => {
-		// At boot time, any process kanban spawned in its previous lifetime is
-		// dead (children of a parent process that no longer exists). The
-		// persisted `state` field in sessions.json is therefore stale —
-		// including the "running" entries. Trust the column position instead:
-		// any card in `in_progress`/`review` with a session record needs respawn.
-		// Cards without a session record (clean board) are skipped because
-		// `claude --continue` would fail with "No conversations to continue".
-		return sessions[card.id] !== undefined;
-	});
+	const candidates = allCards;
 	input.onCandidateCount(candidates.length);
 	if (candidates.length === 0) {
 		return;
 	}
-	logInfo(`[auto-resume] workspace ${input.workspaceId}: resuming ${candidates.length} task(s)`);
+	logInfo(`[auto-resume] workspace ${input.workspaceId}: ${candidates.length} task(s) to process`);
 
 	const runtimeConfig = await input.loadScopedRuntimeConfig({
 		workspaceId: input.workspaceId,
@@ -144,6 +141,7 @@ async function resumeWorkspace(input: ResumeWorkspaceInput): Promise<void> {
 			continue;
 		}
 		const summary = sessions[card.id];
+		const hasHistory = summary !== undefined;
 		// Order: per-task override (card.agentId) > previous run (summary.agentId) > workspace default.
 		const effectiveAgentId = card.agentId ?? summary?.agentId ?? runtimeConfig.selectedAgentId;
 		if (effectiveAgentId !== SUPPORTED_AGENT_ID) {
@@ -162,6 +160,10 @@ async function resumeWorkspace(input: ResumeWorkspaceInput): Promise<void> {
 				taskId: card.id,
 				baseRef: card.baseRef,
 				startInPlanMode: card.startInPlanMode,
+				// With history → resume mode (claude --continue, empty prompt).
+				// Without history → fresh start with the task's original prompt.
+				resume: hasHistory,
+				prompt: hasHistory ? "" : card.prompt,
 			});
 		} catch (err) {
 			logError(`[auto-resume] task ${card.id} failed to spawn`, err);
@@ -181,6 +183,11 @@ interface SpawnOneInput {
 	taskId: string;
 	baseRef: string;
 	startInPlanMode?: boolean;
+	// When true, claude is launched with `--continue` and an empty kickoff
+	// prompt — used for tasks that already have chat history. When false,
+	// the agent starts fresh and receives `prompt` as its first input.
+	resume: boolean;
+	prompt: string;
 }
 
 async function spawnOne(input: SpawnOneInput): Promise<void> {
@@ -201,7 +208,7 @@ async function spawnOne(input: SpawnOneInput): Promise<void> {
 		input.runtimeConfig.selectedAgentId === SUPPORTED_AGENT_ID
 			? input.runtimeConfig
 			: { ...input.runtimeConfig, selectedAgentId: SUPPORTED_AGENT_ID };
-	const resolved = resolveAgentCommand(resolvedConfig, { resume: true });
+	const resolved = resolveAgentCommand(resolvedConfig, { resume: input.resume });
 	if (!resolved) {
 		logInfo(`[auto-resume] task ${input.taskId} skipped (no runnable claude binary on PATH)`);
 		return;
@@ -213,11 +220,12 @@ async function spawnOne(input: SpawnOneInput): Promise<void> {
 		args: resolved.args,
 		autonomousModeEnabled: resolvedConfig.agentAutonomousModeEnabled,
 		cwd: pathInfo.path,
-		// Empty kickoff prompt: claude --continue restores prior chat; the
-		// user decides what to send next via the UI.
-		prompt: "",
+		// Resume → empty prompt (claude --continue restores prior chat).
+		// Fresh start → original task prompt as kickoff.
+		prompt: input.prompt,
 		startInPlanMode: input.startInPlanMode,
 		workspaceId: input.workspaceId,
 	});
-	logInfo(`[auto-resume] task ${input.taskId} spawned with resume=true`);
+	const mode = input.resume ? "resume=true" : "fresh start";
+	logInfo(`[auto-resume] task ${input.taskId} spawned (${mode})`);
 }
