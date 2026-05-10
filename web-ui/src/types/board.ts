@@ -49,6 +49,11 @@ export interface BoardCard {
 	baseRef: string;
 	createdAt: number;
 	updatedAt: number;
+	// Set by the server-side auto-review manager when an auto-commit/PR attempt
+	// completed but verification failed (typically: the cherry-pick to baseRef
+	// didn't land, so the branch tip never advanced). The card stays in review
+	// and this field surfaces the reason. Cleared on the next arm attempt.
+	autoReviewLastError?: { at: number; reason: string } | null;
 }
 
 export interface BoardColumn {

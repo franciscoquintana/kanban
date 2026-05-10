@@ -146,6 +146,20 @@ export const runtimeBoardCardSchema = z
 		baseRef: z.string(),
 		createdAt: z.number(),
 		updatedAt: z.number(),
+		// Set by the server-side auto-review manager when an auto-commit/PR
+		// attempt completed but verification failed (typically: agent committed
+		// locally but the cherry-pick to `baseRef` did not propagate, so the
+		// branch tip did not advance). The card stays in `review` instead of
+		// being trashed, and this field carries the reason for the UI to
+		// surface it. Cleared on the next arm attempt.
+		// See `.plan/docs/fork-server-side-auto-review.md`.
+		autoReviewLastError: z
+			.object({
+				at: z.number(),
+				reason: z.string(),
+			})
+			.nullable()
+			.optional(),
 	})
 	.transform(
 		({

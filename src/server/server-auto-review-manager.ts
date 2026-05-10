@@ -63,6 +63,12 @@ interface PendingEntry {
 	scheduledAction: ScheduledAction | null;
 	actionTimer: NodeJS.Timeout | null;
 	moveToTrashInFlight: boolean;
+	// Last column the card was observed in. Lets us:
+	//   1. Keep an armed entry alive when the agent reactivates and the
+	//      to_in_progress hook moves the card review → in_progress mid-commit.
+	//   2. Emit the right `fromColumnId` on the auto_action_pending broadcast
+	//      so the move-to-trash animation comes from the card's actual column.
+	currentColumnId: "review" | "in_progress" | null;
 }
 
 export interface AutoActionPendingPayload {
@@ -86,6 +92,19 @@ export interface CreateServerAutoReviewManagerDependencies {
 	// unsubscribe when it has no more pending tasks for that workspace.
 	subscribeWorkspaceMetadataMonitor: (workspaceId: string, workspacePath: string) => Promise<void> | void;
 	unsubscribeWorkspaceMetadataMonitor: (workspaceId: string) => void;
+	// Synchronous read of the monitor's last cached snapshot for a workspace.
+	// Returns null when the monitor has no entry for that workspace yet (e.g.
+	// before the first refresh). Used to seed the manager's per-task cache at
+	// register time so `evaluate` can fire immediately even when the polled
+	// snapshot is stable (and therefore not emitting `onMetadataUpdated`).
+	getCurrentWorkspaceMetadata: (workspaceId: string) => RuntimeWorkspaceMetadata | null;
+	// Auto-start a linked backlog task that became ready after a prerequisite
+	// was trashed. Mirrors what `kanban task done` does for `readyTaskIds`:
+	// ensure the task's worktree, spawn its agent process, and move the card
+	// from `backlog` to `in_progress`. Without this, linked tasks freed by an
+	// auto-trash sit in `in_progress` (or wherever they land) without an
+	// active agent — the user complaint that drove this hookup.
+	autoStartLinkedReadyTask: (workspaceId: string, workspacePath: string, taskId: string) => Promise<void>;
 }
 
 export interface RegisterTaskForAutoReviewParams {
@@ -222,12 +241,58 @@ export function createServerAutoReviewManager(
 		}
 	}
 
+	async function setCardAutoReviewLastError(
+		workspacePath: string,
+		taskId: string,
+		error: { at: number; reason: string } | null,
+	): Promise<void> {
+		try {
+			const result = await mutateWorkspaceState<{ updated: boolean }>(workspacePath, (latestState) => {
+				let updated = false;
+				const columns = latestState.board.columns.map((column) => {
+					const cards = column.cards.map((card) => {
+						if (card.id !== taskId) {
+							return card;
+						}
+						const current = card.autoReviewLastError ?? null;
+						if (current === error || (current !== null && error !== null && current.at === error.at)) {
+							return card;
+						}
+						updated = true;
+						return { ...card, autoReviewLastError: error };
+					});
+					return updated && cards !== column.cards ? { ...column, cards } : column;
+				});
+				if (!updated) {
+					return { board: latestState.board, value: { updated: false }, save: false };
+				}
+				const nextBoard = { ...latestState.board, columns };
+				const nextState: RuntimeWorkspaceStateResponse = { ...latestState, board: nextBoard };
+				return { board: nextState.board, value: { updated: true } };
+			});
+			if (result.saved) {
+				// Surface the change to any connected frontend so it can render
+				// the warning marker without a manual refresh.
+				const workspaceId = pendingByTaskId.get(taskId)?.workspaceId;
+				if (workspaceId) {
+					void deps.broadcastRuntimeWorkspaceStateUpdated(workspaceId, workspacePath);
+				}
+			}
+		} catch (err) {
+			logError(`[ServerAutoReview] setCardAutoReviewLastError(${taskId}) failed:`, err);
+		}
+	}
+
 	async function executeCommitOrPr(entry: PendingEntry): Promise<void> {
 		const meta = latestMetadataByTaskId.get(entry.taskId);
 		if (!meta) {
 			logWarn(`${logTag(entry.taskId, entry.baseRef)} no metadata available, skipping commit`);
 			return;
 		}
+
+		// Clear any prior auto-review error before this fresh attempt; if it
+		// fails again `disarmWithoutTrash` will set a new one.
+		await setCardAutoReviewLastError(entry.workspacePath, entry.taskId, null);
 
 		// Capture baselines BEFORE sending the prompt so the verification later
 		// is faithful (the agent might commit very quickly).
@@ -269,7 +334,15 @@ export function createServerAutoReviewManager(
 				if (!terminalManager) {
 					throw new Error("terminal manager unavailable for workspace");
 				}
-				const pasted = terminalManager.writeInput(entry.taskId, Buffer.from(prompt, "utf8"));
+				// Mirror exactly what `web-ui/src/hooks/use-git-actions.ts` did
+				// before the server-side migration: paste the prompt wrapped
+				// in bracketed-paste markers (no trailing `\r`), wait ~200 ms,
+				// then send a separate `\r` to submit. Splitting the two
+				// writes matters: claude's TUI consumes the `\r` adjacent to
+				// `\e[201~` as part of the paste-close handling, so a combined
+				// sequence pastes but never submits — which is what we
+				// observed (prompt arrives, no Enter, claude stays idle).
+				const pasted = terminalManager.writeInput(entry.taskId, Buffer.from(`[200~${prompt}[201~`, "utf8"));
 				if (!pasted) {
 					throw new Error("terminal session not running");
 				}
@@ -295,27 +368,44 @@ export function createServerAutoReviewManager(
 			deps.broadcastAutoActionPending({
 				workspaceId: entry.workspaceId,
 				taskId: entry.taskId,
-				fromColumnId: "review",
+				fromColumnId: entry.currentColumnId ?? "review",
 				action: "move_to_trash",
 			});
 			// Yield briefly so any connected frontend can start its local
 			// move animation before our state mutation broadcast lands.
 			await new Promise<void>((resolve) => setTimeout(resolve, MOVE_ANIMATION_GRACE_MS));
 
-			const mutation = await mutateWorkspaceState<{ moved: boolean }>(entry.workspacePath, (latestState) => {
-				const trashed = trashTaskAndGetReadyLinkedTaskIds(latestState.board, entry.taskId);
-				if (!trashed.moved) {
-					return { board: latestState.board, value: { moved: false }, save: false };
-				}
-				const nextState: RuntimeWorkspaceStateResponse = { ...latestState, board: trashed.board };
-				return { board: nextState.board, value: { moved: true } };
-			});
+			const mutation = await mutateWorkspaceState<{ moved: boolean; readyTaskIds: string[] }>(
+				entry.workspacePath,
+				(latestState) => {
+					const trashed = trashTaskAndGetReadyLinkedTaskIds(latestState.board, entry.taskId);
+					if (!trashed.moved) {
+						return { board: latestState.board, value: { moved: false, readyTaskIds: [] }, save: false };
+					}
+					const nextState: RuntimeWorkspaceStateResponse = { ...latestState, board: trashed.board };
+					return { board: nextState.board, value: { moved: true, readyTaskIds: trashed.readyTaskIds } };
+				},
+			);
 
 			if (mutation.saved) {
 				logInfo(`${logTag(entry.taskId, entry.baseRef)} moved to trash`);
 				const terminalManager = deps.getTerminalManagerForWorkspace(entry.workspaceId);
 				terminalManager?.stopTaskSession(entry.taskId);
 				void deps.broadcastRuntimeWorkspaceStateUpdated(entry.workspaceId, entry.workspacePath);
+				// Auto-start any linked backlog tasks the trash just unblocked.
+				// Mirrors what `kanban task done` does in `commands/task.ts:trashTask`.
+				const readyTaskIds = mutation.value?.readyTaskIds ?? [];
+				for (const readyTaskId of readyTaskIds) {
+					try {
+						await deps.autoStartLinkedReadyTask(entry.workspaceId, entry.workspacePath, readyTaskId);
+						logInfo(`${logTag(entry.taskId, entry.baseRef)} auto-started linked task ${readyTaskId}`);
+					} catch (startErr) {
+						logError(
+							`${logTag(entry.taskId, entry.baseRef)} failed to auto-start linked task ${readyTaskId}:`,
+							startErr,
+						);
+					}
+				}
 			} else {
 				logInfo(`${logTag(entry.taskId, entry.baseRef)} already gone from review, nothing to trash`);
 			}
@@ -338,6 +428,13 @@ export function createServerAutoReviewManager(
 		entry.headCommitAtArm = null;
 		clearTimer(entry);
 		releaseSlot(entry.baseRef, entry.taskId);
+		// Persist the failure on the card so the UI can surface it. Fire and
+		// forget — the card's `autoReviewLastError` becomes the visible
+		// breadcrumb even after kanban restarts. Cleared on the next arm.
+		void setCardAutoReviewLastError(entry.workspacePath, entry.taskId, {
+			at: Date.now(),
+			reason: `Auto-${entry.autoReviewMode === "pr" ? "PR" : "commit"} failed: ${reason}`,
+		});
 	}
 
 	async function evaluate(entry: PendingEntry): Promise<void> {
@@ -386,6 +483,19 @@ export function createServerAutoReviewManager(
 			clearTimer(entry);
 			return;
 		}
+		// Don't arm unless the underlying agent session is actually idle and
+		// ready to receive input. Right after kanban restarts, auto-resume
+		// spawns `claude --continue` and the card is sitting in `review`
+		// (persisted) but the agent's TUI is still loading/resuming — pasting
+		// the commit prompt at that moment loses bytes. Wait until the agent
+		// emits a fresh `Stop` (which moves the session to `awaiting_review`
+		// and re-fires `registerTaskForAutoReview` via the to_review hook).
+		const terminalManager = deps.getTerminalManagerForWorkspace(entry.workspaceId);
+		const sessionSummary = terminalManager?.getSummary(entry.taskId) ?? null;
+		if (!sessionSummary || sessionSummary.state !== "awaiting_review") {
+			clearTimer(entry);
+			return;
+		}
 		const inFlight = inFlightByBaseRef.get(entry.baseRef);
 		if (inFlight && inFlight !== entry.taskId) {
 			enqueue(entry.baseRef, entry.taskId);
@@ -426,10 +536,21 @@ export function createServerAutoReviewManager(
 			scheduledAction: null,
 			actionTimer: null,
 			moveToTrashInFlight: false,
+			currentColumnId: "review",
 		};
 		pendingByTaskId.set(params.taskId, entry);
 		acquireMetadataSubscription(params.workspaceId, params.workspacePath);
 		logInfo(`${logTag(entry.taskId, entry.baseRef)} registered for auto-review (mode=${entry.autoReviewMode})`);
+		// Seed `latestMetadataByTaskId` from the monitor's current cache so
+		// `evaluate` can fire immediately. The monitor only emits
+		// `onMetadataUpdated` on snapshot diffs, so without this seed a newly
+		// registered task with stable git state would never get evaluated.
+		const currentSnapshot = deps.getCurrentWorkspaceMetadata(params.workspaceId);
+		if (currentSnapshot) {
+			for (const tw of currentSnapshot.taskWorkspaces) {
+				latestMetadataByTaskId.set(tw.taskId, tw);
+			}
+		}
 		void evaluate(entry);
 	}
 
@@ -447,31 +568,34 @@ export function createServerAutoReviewManager(
 	}
 
 	function onWorkspaceStateUpdated(workspaceId: string, workspacePath: string, board: RuntimeBoardData): void {
-		// Source of truth = current column position. The to_review hook from
-		// the agent only flips the session state machine; it does NOT move
-		// the card. The card transitions into review when:
-		//   - a user drags it, or
-		//   - a programmatic move is triggered (frontend / future server).
-		// Because of that, registering on the hook can race the card-move
-		// (we'd register, then a state-update fires the OLD board with the
-		// card still in in_progress, and we'd unregister immediately).
-		//
-		// So we treat the column as authoritative: a card present in `review`
-		// with autoReviewEnabled gets a pending entry; a card no longer in
-		// `review` gets dropped. Simple, idempotent, race-free.
+		// Source of truth = current column position. A card in `review` with
+		// `autoReviewEnabled` gets a pending entry; cards in `in_progress` are
+		// only tracked transiently when the card was *armed* in review and the
+		// agent has just reactivated to perform the auto-commit (the
+		// `to_in_progress` hook moves the card mid-commit). We don't want to
+		// drop the entry in that window — verification + trash still has to
+		// run when changedFiles drops to 0 and baseRef has advanced.
 		const reviewCardsById = new Map<string, RuntimeBoardData["columns"][number]["cards"][number]>();
+		const inProgressCardsById = new Map<string, RuntimeBoardData["columns"][number]["cards"][number]>();
 		for (const column of board.columns) {
-			if (column.id !== "review") {
-				continue;
-			}
-			for (const card of column.cards) {
-				reviewCardsById.set(card.id, card);
+			if (column.id === "review") {
+				for (const card of column.cards) {
+					reviewCardsById.set(card.id, card);
+				}
+			} else if (column.id === "in_progress") {
+				for (const card of column.cards) {
+					inProgressCardsById.set(card.id, card);
+				}
 			}
 		}
 
 		// Register cards now in review with autoReviewEnabled.
 		for (const [taskId, card] of reviewCardsById) {
 			if (pendingByTaskId.has(taskId)) {
+				const entry = pendingByTaskId.get(taskId);
+				if (entry) {
+					entry.currentColumnId = "review";
+				}
 				continue;
 			}
 			if (card.autoReviewEnabled !== true) {
@@ -486,12 +610,20 @@ export function createServerAutoReviewManager(
 			});
 		}
 
-		// Drop tracked tasks that have left the review column.
+		// For every tracked entry whose card is no longer in review:
+		//   - if armed AND now in in_progress → keep tracking (auto-commit
+		//     in flight; verification + trash will follow when changedFiles
+		//     reaches 0).
+		//   - otherwise → drop.
 		for (const [taskId, entry] of pendingByTaskId) {
 			if (entry.workspaceId !== workspaceId) {
 				continue;
 			}
 			if (reviewCardsById.has(taskId)) {
+				continue;
+			}
+			if (entry.armed && inProgressCardsById.has(taskId)) {
+				entry.currentColumnId = "in_progress";
 				continue;
 			}
 			clearTimer(entry);

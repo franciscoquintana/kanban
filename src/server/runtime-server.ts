@@ -25,6 +25,7 @@ import {
 	getKanbanRuntimeTls,
 	isKanbanRemoteHost,
 } from "../core/runtime-endpoint";
+import { moveTaskToColumn } from "../core/task-board-mutations";
 import {
 	checkRateLimit,
 	clearRateLimit,
@@ -37,8 +38,8 @@ import {
 	validatePasscode,
 	validateSession,
 } from "../security/passcode-manager";
-import { loadWorkspaceContextById } from "../state/workspace-state";
-import { buildRuntimeConfigResponse } from "../terminal/agent-registry";
+import { loadWorkspaceBoardById, loadWorkspaceContextById, mutateWorkspaceState } from "../state/workspace-state";
+import { buildRuntimeConfigResponse, resolveAgentCommand } from "../terminal/agent-registry";
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import { createTerminalWebSocketBridge } from "../terminal/ws-server";
 import { type RuntimeTrpcContext, type RuntimeTrpcWorkspaceScope, runtimeAppRouter } from "../trpc/app-router";
@@ -46,6 +47,7 @@ import { createHooksApi } from "../trpc/hooks-api";
 import { createProjectsApi } from "../trpc/projects-api";
 import { createRuntimeApi } from "../trpc/runtime-api";
 import { createWorkspaceApi } from "../trpc/workspace-api";
+import { ensureTaskWorktreeIfDoesntExist } from "../workspace/task-worktree";
 import { getWebUiDir, normalizeRequestPath, readAsset } from "./assets";
 import { resumeInProgressTasksOnBoot } from "./auto-resume-on-boot";
 import { handleHttpRequest, handleSocketUpgrade } from "./middleware";
@@ -180,6 +182,65 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 	//   the scoped runtime-config loader plus a fresh provider service.
 	// See `.plan/docs/fork-server-side-auto-review.md`.
 	const autoReviewProviderService = createClineProviderService();
+
+	// Auto-start a linked backlog task that was just unblocked by an
+	// auto-trash. Replicates the flow `kanban task done` runs in
+	// `commands/task.ts:trashTask` for `readyTaskIds`: ensure worktree, spawn
+	// agent, move card to `in_progress`. Without this, the linked tasks land
+	// in `in_progress` (or backlog) without a live agent process. See
+	// `.plan/docs/fork-server-side-auto-review.md`.
+	const autoStartLinkedReadyTask = async (
+		workspaceId: string,
+		workspacePath: string,
+		taskId: string,
+	): Promise<void> => {
+		const board = await loadWorkspaceBoardById(workspaceId);
+		const card = board.columns.flatMap((col) => col.cards).find((c) => c.id === taskId);
+		if (!card) {
+			throw new Error(`Linked ready task ${taskId} not found on board`);
+		}
+		const ensured = await ensureTaskWorktreeIfDoesntExist({
+			cwd: workspacePath,
+			taskId,
+			baseRef: card.baseRef,
+		});
+		if (!ensured.ok) {
+			throw new Error(ensured.error ?? `Could not ensure worktree for task ${taskId}`);
+		}
+		const runtimeConfigState = await deps.workspaceRegistry.loadScopedRuntimeConfig({
+			workspaceId,
+			workspacePath,
+		});
+		const resolvedConfig = card.agentId
+			? { ...runtimeConfigState, selectedAgentId: card.agentId }
+			: runtimeConfigState;
+		const resolved = resolveAgentCommand(resolvedConfig);
+		if (!resolved) {
+			throw new Error(`No runnable agent for ${resolvedConfig.selectedAgentId} on PATH`);
+		}
+		const terminalManager = await deps.ensureTerminalManagerForWorkspace(workspaceId, workspacePath);
+		await terminalManager.startTaskSession({
+			taskId,
+			agentId: resolved.agentId,
+			binary: resolved.binary,
+			args: resolved.args,
+			autonomousModeEnabled: resolvedConfig.agentAutonomousModeEnabled,
+			cwd: ensured.path,
+			prompt: card.prompt,
+			startInPlanMode: card.startInPlanMode,
+			workspaceId,
+		});
+		await mutateWorkspaceState(workspacePath, (latestState) => {
+			const moved = moveTaskToColumn(latestState.board, taskId, "in_progress", Date.now());
+			if (!moved.moved) {
+				return { board: latestState.board, value: { moved: false }, save: false };
+			}
+			const nextState: RuntimeWorkspaceStateResponse = { ...latestState, board: moved.board };
+			return { board: nextState.board, value: { moved: true } };
+		});
+		void deps.runtimeStateHub.broadcastRuntimeWorkspaceStateUpdated(workspaceId, workspacePath);
+	};
+
 	const serverAutoReviewManager = createServerAutoReviewManager({
 		getTerminalManagerForWorkspace: deps.workspaceRegistry.getTerminalManagerForWorkspace,
 		getClineTaskSessionServiceForWorkspace: (workspaceId) =>
@@ -196,6 +257,8 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		broadcastAutoActionPending: deps.runtimeStateHub.broadcastAutoActionPending,
 		subscribeWorkspaceMetadataMonitor: deps.runtimeStateHub.subscribeWorkspaceMetadataMonitor,
 		unsubscribeWorkspaceMetadataMonitor: deps.runtimeStateHub.unsubscribeWorkspaceMetadataMonitor,
+		getCurrentWorkspaceMetadata: deps.runtimeStateHub.getCurrentWorkspaceMetadata,
+		autoStartLinkedReadyTask,
 	});
 	deps.autoReviewManagerRef.current = serverAutoReviewManager;
 

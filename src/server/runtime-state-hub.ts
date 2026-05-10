@@ -20,6 +20,7 @@ import type {
 	RuntimeStateStreamWorkspaceMetadataMessage,
 	RuntimeStateStreamWorkspaceStateMessage,
 	RuntimeTaskSessionSummary,
+	RuntimeWorkspaceMetadata,
 } from "../core/api-contract";
 import { loadWorkspaceBoardById } from "../state/workspace-state";
 import type { TerminalSessionManager } from "../terminal/session-manager";
@@ -73,6 +74,7 @@ export interface RuntimeStateHub {
 	// monitor's subscriber count for the workspace.
 	subscribeWorkspaceMetadataMonitor: (workspaceId: string, workspacePath: string) => Promise<void>;
 	unsubscribeWorkspaceMetadataMonitor: (workspaceId: string) => void;
+	getCurrentWorkspaceMetadata: (workspaceId: string) => RuntimeWorkspaceMetadata | null;
 	close: () => Promise<void>;
 }
 
@@ -673,6 +675,9 @@ export function createRuntimeStateHub(deps: CreateRuntimeStateHubDependencies): 
 		},
 		unsubscribeWorkspaceMetadataMonitor: (workspaceId) => {
 			workspaceMetadataMonitor.disconnectWorkspace(workspaceId);
+		},
+		getCurrentWorkspaceMetadata: (workspaceId) => {
+			return workspaceMetadataMonitor.getCurrentMetadata(workspaceId);
 		},
 		close: async () => {
 			for (const timer of taskSessionBroadcastTimersByWorkspaceId.values()) {
