@@ -52,6 +52,7 @@ export interface WorkspaceMetadataMonitor {
 	}) => Promise<RuntimeWorkspaceMetadata>;
 	disconnectWorkspace: (workspaceId: string) => void;
 	disposeWorkspace: (workspaceId: string) => void;
+	getCurrentMetadata: (workspaceId: string) => RuntimeWorkspaceMetadata | null;
 	close: () => void;
 }
 
@@ -378,6 +379,13 @@ export function createWorkspaceMetadataMonitor(
 			}
 			stopWorkspaceTimer(entry);
 			workspaces.delete(workspaceId);
+		},
+		getCurrentMetadata: (workspaceId) => {
+			const entry = workspaces.get(workspaceId);
+			if (!entry) {
+				return null;
+			}
+			return buildWorkspaceMetadataSnapshot(entry);
 		},
 		close: () => {
 			for (const entry of workspaces.values()) {

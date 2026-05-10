@@ -397,9 +397,21 @@ export function BoardCard({
 	}, [descriptionFont, descriptionWidth, displayDescription]);
 
 	const isCreditLimit = isCardCreditLimitError(sessionSummary);
+	const autoReviewLastError = card.autoReviewLastError ?? null;
 	const renderStatusMarker = () => {
 		if (isCreditLimit) {
 			return <AlertTriangle size={12} className="text-status-orange" />;
+		}
+		// Auto-commit/PR verification failed (typically the cherry-pick to
+		// baseRef did not propagate). The card stays in review for the user
+		// to investigate; surface a warning marker with the reason. Cleared
+		// when the manager rearms for a fresh attempt.
+		if (columnId === "review" && autoReviewLastError) {
+			return (
+				<Tooltip content={autoReviewLastError.reason}>
+					<AlertTriangle size={12} className="text-status-orange" />
+				</Tooltip>
+			);
 		}
 		if (columnId === "in_progress") {
 			if (sessionSummary?.state === "failed") {
