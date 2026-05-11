@@ -44,11 +44,29 @@ import { logError, logInfo, logWarn } from "./server-log.js";
 const ACTION_DEBOUNCE_MS = 500;
 
 type ScheduledAction = "commit" | "pr" | "move_to_trash";
+
+// Persisted on the board card so the in-memory `armed` state survives a
+// kanban restart. The card-side shape matches `autoReviewArmState` on
+// `runtimeBoardCardSchema`. See `.plan/docs/fork-server-side-auto-review.md`.
+interface PersistedArmState {
+	at: number;
+	baseRefTipAtArm: string | null;
+	headCommitAtArm: string | null;
+	mode: RuntimeTaskAutoReviewMode;
+}
 // Microsleep we yield before doing the actual move-to-trash mutation, to give
 // connected frontends time to start the local move animation (after we've
 // emitted the `auto_action_pending` broadcast). Empirical: 80ms is enough on
 // localhost and remote SSH+tunnel without being noticeable.
 const MOVE_ANIMATION_GRACE_MS = 80;
+// How long, after arming, we keep re-checking baseRef advancement before
+// concluding the commit didn't propagate. The agent typically does
+// `git commit` (drops changedFiles to 0) seconds before `git cherry-pick`
+// onto baseRef finishes — without this grace window we'd disarm too early
+// and the card would stay in review even though baseRef eventually advances.
+const VERIFICATION_GRACE_PERIOD_MS = 60_000;
+// Backoff between re-checks of baseRef tip during the grace period.
+const VERIFICATION_RECHECK_INTERVAL_MS = 5_000;
 
 interface PendingEntry {
 	workspaceId: string;
@@ -69,6 +87,9 @@ interface PendingEntry {
 	//   2. Emit the right `fromColumnId` on the auto_action_pending broadcast
 	//      so the move-to-trash animation comes from the card's actual column.
 	currentColumnId: "review" | "in_progress" | null;
+	// Re-check timer used by the verification grace window. Separate from
+	// `actionTimer` (commit/PR/trash debounce) so the two don't conflict.
+	verificationRecheckTimer: NodeJS.Timeout | null;
 }
 
 export interface AutoActionPendingPayload {
@@ -113,6 +134,11 @@ export interface RegisterTaskForAutoReviewParams {
 	taskId: string;
 	baseRef: string;
 	autoReviewMode: RuntimeTaskAutoReviewMode;
+	// Optional arm state to rehydrate from the persisted card. When present,
+	// the entry starts as `armed=true` and the verification path runs from
+	// the next evaluate (no fresh commit prompt is dispatched). Lets the
+	// manager finish trashing a card whose commit landed across a restart.
+	persistedArmState?: PersistedArmState | null;
 }
 
 export interface ServerAutoReviewManager {
@@ -188,6 +214,13 @@ export function createServerAutoReviewManager(
 		}
 	}
 
+	function clearVerificationRecheck(entry: PendingEntry): void {
+		if (entry.verificationRecheckTimer !== null) {
+			clearTimeout(entry.verificationRecheckTimer);
+			entry.verificationRecheckTimer = null;
+		}
+	}
+
 	function scheduleAction(entry: PendingEntry, action: ScheduledAction, run: () => void): void {
 		if (entry.actionTimer !== null && entry.scheduledAction === action) {
 			return;
@@ -197,6 +230,21 @@ export function createServerAutoReviewManager(
 		const timer = setTimeout(() => {
 			entry.actionTimer = null;
 			entry.scheduledAction = null;
+			// Defensive: there is a race where the timer fires before
+			// `clearTimer` (called from `onWorkspaceStateUpdated`'s unregister
+			// branch) gets a chance to cancel it. Symptoms: the closure keeps
+			// `entry` alive even after it was removed from `pendingByTaskId`,
+			// so `run()` would paste a stale commit prompt to the agent while
+			// a NEW entry for the same task is also scheduling its own arm
+			// → two commit prompts back-to-back. Skip silently and clean up
+			// any slot we may still hold so the legitimate replacement entry
+			// can proceed unblocked.
+			if (pendingByTaskId.get(entry.taskId) !== entry) {
+				if (inFlightByBaseRef.get(entry.baseRef) === entry.taskId) {
+					releaseSlot(entry.baseRef, entry.taskId);
+				}
+				return;
+			}
 			run();
 		}, ACTION_DEBOUNCE_MS);
 		// Don't keep the process alive if this is the only thing pending.
@@ -283,6 +331,48 @@ export function createServerAutoReviewManager(
 		}
 	}
 
+	async function setCardAutoReviewArmState(
+		workspacePath: string,
+		taskId: string,
+		armState: PersistedArmState | null,
+	): Promise<void> {
+		try {
+			await mutateWorkspaceState<{ updated: boolean }>(workspacePath, (latestState) => {
+				let updated = false;
+				const columns = latestState.board.columns.map((column) => {
+					const cards = column.cards.map((card) => {
+						if (card.id !== taskId) {
+							return card;
+						}
+						const current = card.autoReviewArmState ?? null;
+						const same =
+							(current === null && armState === null) ||
+							(current !== null &&
+								armState !== null &&
+								current.at === armState.at &&
+								current.baseRefTipAtArm === armState.baseRefTipAtArm &&
+								current.headCommitAtArm === armState.headCommitAtArm &&
+								current.mode === armState.mode);
+						if (same) {
+							return card;
+						}
+						updated = true;
+						return { ...card, autoReviewArmState: armState };
+					});
+					return updated && cards !== column.cards ? { ...column, cards } : column;
+				});
+				if (!updated) {
+					return { board: latestState.board, value: { updated: false }, save: false };
+				}
+				const nextBoard = { ...latestState.board, columns };
+				const nextState: RuntimeWorkspaceStateResponse = { ...latestState, board: nextBoard };
+				return { board: nextState.board, value: { updated: true } };
+			});
+		} catch (err) {
+			logError(`[ServerAutoReview] setCardAutoReviewArmState(${taskId}) failed:`, err);
+		}
+	}
+
 	async function executeCommitOrPr(entry: PendingEntry): Promise<void> {
 		const meta = latestMetadataByTaskId.get(entry.taskId);
 		if (!meta) {
@@ -301,6 +391,16 @@ export function createServerAutoReviewManager(
 		entry.headCommitAtArm = meta.headCommit;
 		entry.armed = true;
 		entry.armedAt = Date.now();
+
+		// Persist arm state on the card so a kanban restart can rehydrate the
+		// in-memory `armed` flag and finish the verification/trash flow even
+		// if the agent is mid-cherry-pick when the server dies.
+		await setCardAutoReviewArmState(entry.workspacePath, entry.taskId, {
+			at: entry.armedAt,
+			baseRefTipAtArm: entry.baseRefTipAtArm,
+			headCommitAtArm: entry.headCommitAtArm,
+			mode: entry.autoReviewMode,
+		});
 
 		const config = await deps.getRuntimeConfigForWorkspace(entry.workspaceId);
 		const action: TaskGitAction = entry.autoReviewMode === "pr" ? "pr" : "commit";
@@ -412,6 +512,7 @@ export function createServerAutoReviewManager(
 		} catch (err) {
 			logError(`${logTag(entry.taskId, entry.baseRef)} move-to-trash failed:`, err);
 		} finally {
+			clearVerificationRecheck(entry);
 			pendingByTaskId.delete(entry.taskId);
 			latestMetadataByTaskId.delete(entry.taskId);
 			releaseSlot(entry.baseRef, entry.taskId);
@@ -427,6 +528,7 @@ export function createServerAutoReviewManager(
 		entry.baseRefTipAtArm = null;
 		entry.headCommitAtArm = null;
 		clearTimer(entry);
+		clearVerificationRecheck(entry);
 		releaseSlot(entry.baseRef, entry.taskId);
 		// Persist the failure on the card so the UI can surface it. Fire and
 		// forget — the card's `autoReviewLastError` becomes the visible
@@ -435,6 +537,9 @@ export function createServerAutoReviewManager(
 			at: Date.now(),
 			reason: `Auto-${entry.autoReviewMode === "pr" ? "PR" : "commit"} failed: ${reason}`,
 		});
+		// Drop the persisted arm state — a future register should start fresh
+		// instead of rehydrating into the failed run.
+		void setCardAutoReviewArmState(entry.workspacePath, entry.taskId, null);
 	}
 
 	async function evaluate(entry: PendingEntry): Promise<void> {
@@ -463,9 +568,43 @@ export function createServerAutoReviewManager(
 				return;
 			}
 			if (tipNow === entry.baseRefTipAtArm) {
+				// The local commit landed (changedFiles === 0) but the
+				// cherry-pick onto baseRef hasn't bumped the branch tip yet.
+				// Usually that means the agent is still mid-cherry-pick — they
+				// run `git commit` first and only after that `git -C P cherry-pick`,
+				// so this branch fires within seconds of `git commit`. Give it a
+				// grace window before concluding the work was lost.
+				const elapsedSinceArm = entry.armedAt === null ? Number.POSITIVE_INFINITY : Date.now() - entry.armedAt;
+				if (elapsedSinceArm < VERIFICATION_GRACE_PERIOD_MS) {
+					// Schedule a recheck unless one is already pending.
+					if (entry.verificationRecheckTimer === null) {
+						const remaining = Math.max(0, VERIFICATION_GRACE_PERIOD_MS - elapsedSinceArm);
+						const recheckDelay = Math.min(VERIFICATION_RECHECK_INTERVAL_MS, remaining);
+						logInfo(
+							`${logTag(entry.taskId, entry.baseRef)} baseRef still at ${entry.baseRefTipAtArm}; cherry-pick may be in flight, rechecking in ${recheckDelay}ms (grace=${Math.round(remaining / 1000)}s left)`,
+						);
+						const timer = setTimeout(() => {
+							entry.verificationRecheckTimer = null;
+							// Re-evaluate only if the entry is still the live one
+							// (the same defensive check we have in scheduleAction).
+							if (pendingByTaskId.get(entry.taskId) !== entry) {
+								return;
+							}
+							if (!entry.armed) {
+								return;
+							}
+							void evaluate(entry).catch((err) => {
+								logError(`${logTag(entry.taskId, entry.baseRef)} verification recheck failed:`, err);
+							});
+						}, recheckDelay);
+						timer.unref?.();
+						entry.verificationRecheckTimer = timer;
+					}
+					return;
+				}
 				disarmWithoutTrash(
 					entry,
-					`baseRef tip did not advance (${entry.baseRefTipAtArm}). Commit was NOT propagated to ${entry.baseRef}.`,
+					`baseRef tip did not advance (${entry.baseRefTipAtArm}) within ${VERIFICATION_GRACE_PERIOD_MS / 1000}s. Commit was NOT propagated to ${entry.baseRef}.`,
 				);
 				return;
 			}
@@ -523,24 +662,42 @@ export function createServerAutoReviewManager(
 			void evaluate(existing);
 			return;
 		}
+		const rehydrate = params.persistedArmState ?? null;
+		// On rehydrate we reset the grace-window clock to `now` so that any
+		// kanban downtime between the original arm and this register doesn't
+		// eat into the cherry-pick wait. The original arm timestamp is not
+		// load-bearing — the baselines (baseRefTipAtArm + headCommitAtArm)
+		// are what `evaluate` compares against.
 		const entry: PendingEntry = {
 			workspaceId: params.workspaceId,
 			workspacePath: params.workspacePath,
 			taskId: params.taskId,
 			baseRef: params.baseRef,
 			autoReviewMode: params.autoReviewMode,
-			armed: false,
-			armedAt: null,
-			baseRefTipAtArm: null,
-			headCommitAtArm: null,
+			armed: rehydrate !== null,
+			armedAt: rehydrate !== null ? Date.now() : null,
+			baseRefTipAtArm: rehydrate?.baseRefTipAtArm ?? null,
+			headCommitAtArm: rehydrate?.headCommitAtArm ?? null,
 			scheduledAction: null,
 			actionTimer: null,
 			moveToTrashInFlight: false,
 			currentColumnId: "review",
+			verificationRecheckTimer: null,
 		};
 		pendingByTaskId.set(params.taskId, entry);
 		acquireMetadataSubscription(params.workspaceId, params.workspacePath);
-		logInfo(`${logTag(entry.taskId, entry.baseRef)} registered for auto-review (mode=${entry.autoReviewMode})`);
+		// Rehydrated entries also need the baseRef serialization slot held so
+		// concurrent commit attempts on the same baseRef don't double-fire
+		// while we wait for the verification path to complete.
+		if (rehydrate !== null) {
+			const inFlight = inFlightByBaseRef.get(entry.baseRef);
+			if (!inFlight) {
+				inFlightByBaseRef.set(entry.baseRef, entry.taskId);
+			}
+		}
+		logInfo(
+			`${logTag(entry.taskId, entry.baseRef)} registered for auto-review (mode=${entry.autoReviewMode}${rehydrate !== null ? ", rehydrated as armed" : ""})`,
+		);
 		// Seed `latestMetadataByTaskId` from the monitor's current cache so
 		// `evaluate` can fire immediately. The monitor only emits
 		// `onMetadataUpdated` on snapshot diffs, so without this seed a newly
@@ -607,6 +764,7 @@ export function createServerAutoReviewManager(
 				taskId,
 				baseRef: card.baseRef,
 				autoReviewMode: card.autoReviewMode ?? "commit",
+				persistedArmState: card.autoReviewArmState ?? null,
 			});
 		}
 
@@ -627,6 +785,7 @@ export function createServerAutoReviewManager(
 				continue;
 			}
 			clearTimer(entry);
+			clearVerificationRecheck(entry);
 			pendingByTaskId.delete(taskId);
 			latestMetadataByTaskId.delete(taskId);
 			releaseSlot(entry.baseRef, taskId);
@@ -638,6 +797,7 @@ export function createServerAutoReviewManager(
 	function close(): void {
 		for (const entry of pendingByTaskId.values()) {
 			clearTimer(entry);
+			clearVerificationRecheck(entry);
 		}
 		pendingByTaskId.clear();
 		latestMetadataByTaskId.clear();

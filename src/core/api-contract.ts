@@ -160,6 +160,24 @@ export const runtimeBoardCardSchema = z
 			})
 			.nullable()
 			.optional(),
+		// Persisted arm state for the auto-review manager. Written when
+		// `executeCommitOrPr` arms the entry (just before sending the commit
+		// prompt to the agent), cleared on disarm or trash. Lets the manager
+		// rehydrate the in-memory `armed` state across kanban restarts so
+		// that the verification + trash flow keeps working even if the agent
+		// is mid-cherry-pick when kanban dies. Without this, only the
+		// process that originally armed can verify — the next process
+		// re-registers a fresh `armed=false` entry and never trashes the
+		// completed work.
+		autoReviewArmState: z
+			.object({
+				at: z.number(),
+				baseRefTipAtArm: z.string().nullable(),
+				headCommitAtArm: z.string().nullable(),
+				mode: runtimeTaskAutoReviewModeSchema,
+			})
+			.nullable()
+			.optional(),
 	})
 	.transform(
 		({

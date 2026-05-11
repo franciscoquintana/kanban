@@ -367,6 +367,7 @@ export function createRuntimeStateHub(deps: CreateRuntimeStateHubDependencies): 
 								taskId,
 								baseRef: card.baseRef,
 								autoReviewMode: card.autoReviewMode ?? "commit",
+								persistedArmState: card.autoReviewArmState ?? null,
 							});
 						}
 					}

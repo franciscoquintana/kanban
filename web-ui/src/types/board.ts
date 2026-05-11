@@ -54,6 +54,15 @@ export interface BoardCard {
 	// didn't land, so the branch tip never advanced). The card stays in review
 	// and this field surfaces the reason. Cleared on the next arm attempt.
 	autoReviewLastError?: { at: number; reason: string } | null;
+	// Persisted arm state used by the manager to survive kanban restarts.
+	// Set when the manager arms (just before sending the commit prompt) and
+	// cleared on disarm or trash.
+	autoReviewArmState?: {
+		at: number;
+		baseRefTipAtArm: string | null;
+		headCommitAtArm: string | null;
+		mode: TaskAutoReviewMode;
+	} | null;
 }
 
 export interface BoardColumn {
