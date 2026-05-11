@@ -64,7 +64,14 @@ const MOVE_ANIMATION_GRACE_MS = 80;
 // `git commit` (drops changedFiles to 0) seconds before `git cherry-pick`
 // onto baseRef finishes — without this grace window we'd disarm too early
 // and the card would stay in review even though baseRef eventually advances.
-const VERIFICATION_GRACE_PERIOD_MS = 60_000;
+//
+// This also gates how long the `inFlightByBaseRef` slot is held during the
+// cherry-pick. While the slot is held, NO OTHER task on the same baseRef
+// can have its commit prompt fired (they wait in `queueByBaseRef`). Be
+// generous: a stuck or slow agent disarming early would release the slot,
+// the next queued task would fire its prompt, and we'd end up with two
+// agents fighting over the same target worktree on cherry-pick.
+const VERIFICATION_GRACE_PERIOD_MS = 3_600_000;
 // Backoff between re-checks of baseRef tip during the grace period.
 const VERIFICATION_RECHECK_INTERVAL_MS = 5_000;
 
@@ -769,10 +776,16 @@ export function createServerAutoReviewManager(
 		}
 
 		// For every tracked entry whose card is no longer in review:
-		//   - if armed AND now in in_progress → keep tracking (auto-commit
-		//     in flight; verification + trash will follow when changedFiles
-		//     reaches 0).
-		//   - otherwise → drop.
+		//   - if armed → keep tracking regardless of where the card went.
+		//     The `inFlightByBaseRef` slot stays held so no other task on the
+		//     same baseRef can fire a commit prompt while the agent may still
+		//     be mid-cherry-pick. The verification path (or the grace-window
+		//     timeout) is the ONLY way to release that slot. Releasing here
+		//     would let a queued sibling fire its prompt and we'd end up with
+		//     two agents fighting over the same target worktree on
+		//     cherry-pick — which is exactly what `baseRef` serialization
+		//     exists to prevent.
+		//   - otherwise (unarmed, card left the active columns) → drop.
 		for (const [taskId, entry] of pendingByTaskId) {
 			if (entry.workspaceId !== workspaceId) {
 				continue;
@@ -780,8 +793,14 @@ export function createServerAutoReviewManager(
 			if (reviewCardsById.has(taskId)) {
 				continue;
 			}
-			if (entry.armed && inProgressCardsById.has(taskId)) {
-				entry.currentColumnId = "in_progress";
+			if (entry.armed) {
+				if (inProgressCardsById.has(taskId)) {
+					entry.currentColumnId = "in_progress";
+				}
+				// Card may have been dragged out by the user, trashed manually
+				// or otherwise moved while the cherry-pick is in flight. Keep
+				// the entry — verification or the grace timeout will retire
+				// it cleanly and release the baseRef slot at that point.
 				continue;
 			}
 			clearTimer(entry);
