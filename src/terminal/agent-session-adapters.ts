@@ -1432,6 +1432,11 @@ const ADAPTERS: Record<RuntimeAgentId, AgentSessionAdapter> = {
 	codex: codexAdapter,
 	gemini: geminiAdapter,
 	opencode: opencodeAdapter,
+	// openclaude is a fork of Claude Code, so it accepts the same CLI flags
+	// (--dangerously-skip-permissions, --continue, --permission-mode plan, etc.).
+	// Reuse the Claude adapter; auto-review hooks via ~/.claude/settings.json
+	// will not apply (openclaude has its own settings dir) but core launch works.
+	openclaude: claudeAdapter,
 	droid: droidAdapter,
 	kiro: kiroAdapter,
 	cline: clineAdapter,

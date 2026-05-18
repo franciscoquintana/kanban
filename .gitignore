@@ -25,3 +25,5 @@ packages/desktop/runtime-child.js
 packages/desktop/runtime-child-env.js
 packages/desktop/desktop-preflight.js
 packages/desktop/cli
+
+.claude/logs/

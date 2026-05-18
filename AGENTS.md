@@ -27,6 +27,32 @@ Code quality
 - In `web-ui`, prefer `react-use` hooks (via `@/kanban/utils/react-use`) whenever possible
 - Before adding custom utility code, evaluate whether a well-maintained third-party package can reduce complexity and long-term maintenance cost.
 
+Two-phase delegation: planning vs execution
+When you (Claude/Opus) are running inside a kanban card with `agentId="claude"`, your job is to plan, not to implement. The card spawns the agent with `KANBAN_TASK_ID` in env so you know your own id.
+
+Workflow:
+1. Stay in plan mode while you read the repo and decide the approach.
+2. Exit plan mode only once you have a concrete, mechanical breakdown.
+3. Instead of editing files yourself, create one or more execution cards via:
+
+   kanban task create --agent-id openclaude --prompt "<detailed mechanical plan>"
+
+   Grab the returned `id` and link it to yourself:
+
+   kanban task link --task-id "$KANBAN_TASK_ID" --linked-task-id "<child-id>"
+
+4. The detailed prompt for each execution card must include:
+   - Exact files to read/edit (repo-relative paths).
+   - The exact change to make (with code snippets when useful) — zero design ambiguity.
+   - The acceptance test (a `bun test` filter, a curl, a build command).
+   - A "do NOT touch" list of nearby files/concerns.
+
+5. Your last message in the planning card should be a short index of the child card ids and their sub-task titles.
+
+Only implement yourself if the task is truly trivial (1-line typo, single config flip) or requires judgment qwen will fumble (types, protocol, security, anything in `src/runtime/`).
+
+The user reviews each execution card's diff individually; you do not need to wait for them.
+
 Architecture opinions
 - Avoid thin shell wrappers that only forward props or relocate JSX for a single call site.
 - Prefer extracting domain logic (state, effects, async orchestration) over presentation-only pass-through layers.

@@ -336,7 +336,9 @@ export class TerminalSessionManager implements TerminalSessionService {
 			workspaceId: request.workspaceId,
 		});
 
-		const env = buildTerminalEnvironment(request.env, launch.env);
+		const env = buildTerminalEnvironment(request.env, launch.env, {
+			KANBAN_TASK_ID: request.taskId,
+		});
 
 		// Adapters can wrap the configured agent binary when they need extra runtime wiring
 		// (for example, Codex uses a wrapper script to watch session logs for hook transitions).

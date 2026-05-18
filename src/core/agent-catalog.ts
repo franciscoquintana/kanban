@@ -57,6 +57,15 @@ export const RUNTIME_AGENT_CATALOG: RuntimeAgentCatalogEntry[] = [
 		installUrl: "https://github.com/sst/opencode",
 	},
 	{
+		id: "openclaude",
+		label: "OpenClaude (qwen via local proxy)",
+		binary: "openclaude-qwen",
+		baseArgs: [],
+		autonomousArgs: ["--dangerously-skip-permissions"],
+		resumeArgs: ["--continue"],
+		installUrl: "https://github.com/Gitlawb/openclaude",
+	},
+	{
 		id: "droid",
 		label: "Factory Droid",
 		binary: "droid",
@@ -90,6 +99,7 @@ export const RUNTIME_LAUNCH_SUPPORTED_AGENT_IDS: readonly RuntimeAgentId[] = [
 	"codex",
 	"droid",
 	"kiro",
+	"openclaude",
 	// "opencode",
 	// "gemini",
 ];

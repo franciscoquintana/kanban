@@ -1135,7 +1135,10 @@ export function registerTaskCommand(program: Command): void {
 		.option("--start-in-plan-mode [value]", "Set plan mode (true|false). Flag-only implies true.")
 		.option("--auto-review-enabled [value]", "Enable auto-review behavior (true|false). Flag-only implies true.")
 		.option("--auto-review-mode <mode>", "Auto-review mode: commit | pr.", parseAutoReviewMode)
-		.option("--agent-id <id>", "Agent override: cline | claude | codex | droid | gemini | opencode | default.")
+		.option(
+			"--agent-id <id>",
+			"Agent override: cline | claude | codex | droid | gemini | opencode | openclaude | default.",
+		)
 		.option(
 			"--cline-provider <id>",
 			'Cline provider override (e.g. anthropic, openai, cline). Use "default" for workspace default.',
@@ -1197,7 +1200,7 @@ export function registerTaskCommand(program: Command): void {
 		.option("--auto-review-mode <mode>", "Auto-review mode: commit | pr.", parseAutoReviewMode)
 		.option(
 			"--agent-id <id>",
-			'Agent override: cline | claude | codex | droid | gemini | opencode. Use "default" to clear.',
+			'Agent override: cline | claude | codex | droid | gemini | opencode | openclaude. Use "default" to clear.',
 		)
 		.option(
 			"--cline-provider <id>",
