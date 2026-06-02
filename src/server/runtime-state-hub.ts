@@ -617,13 +617,28 @@ export function createRuntimeStateHub(deps: CreateRuntimeStateHubDependencies): 
 					summary.state === "interrupted" &&
 					deps.autoReviewManagerRef?.current
 				) {
+					// PTY died (process crash, server SIGTERM cascade,
+					// upstream HTTP timeout, manual kill). Do NOT trash:
+					// trash deletes the worktree, which destroys the plan
+					// file, any uncommitted work, and local commits the
+					// agent had not yet cherry-picked. Instead surface the
+					// card as "needs attention" by moving it to review and
+					// emitting the ready-for-review broadcast so the UI
+					// shows the Commit / Move-to-done controls. The user
+					// can then choose to (a) trash manually if the work is
+					// abandoned, (b) restart the agent (auto-resume on the
+					// next server boot will `--continue` from chat history
+					// on disk via auto-resume-on-boot.ts), or (c) cherry-
+					// pick a partial commit manually. Worktree is always
+					// preserved.
 					const workspacePath = deps.workspaceRegistry.getWorkspacePathById(workspaceId);
 					if (workspacePath) {
 						void deps.autoReviewManagerRef.current
-							.moveInterruptedTaskToTrash(workspaceId, workspacePath, summary.taskId)
+							.moveTaskInProgressToReview(workspaceId, workspacePath, summary.taskId)
 							.catch(() => {
 								// Best effort; manager logs internally.
 							});
+						broadcastTaskReadyForReview(workspaceId, summary.taskId);
 					}
 				}
 			});
@@ -665,11 +680,17 @@ export function createRuntimeStateHub(deps: CreateRuntimeStateHubDependencies): 
 					summary.state === "interrupted" &&
 					deps.autoReviewManagerRef?.current
 				) {
+					// Same rationale as the terminal-session branch above:
+					// surface the dead session as needing review, never
+					// auto-trash. Preserves the worktree, the plan file,
+					// and any uncommitted work so the user can decide
+					// whether to resume or abandon.
 					void deps.autoReviewManagerRef.current
-						.moveInterruptedTaskToTrash(workspaceId, workspacePath, summary.taskId)
+						.moveTaskInProgressToReview(workspaceId, workspacePath, summary.taskId)
 						.catch(() => {
 							// Best effort; manager logs internally.
 						});
+					broadcastTaskReadyForReview(workspaceId, summary.taskId);
 				}
 			});
 			clineSummaryUnsubscribeByWorkspaceId.set(workspaceId, unsubscribe);
