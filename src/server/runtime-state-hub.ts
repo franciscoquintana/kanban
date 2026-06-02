@@ -578,6 +578,39 @@ export function createRuntimeStateHub(deps: CreateRuntimeStateHubDependencies): 
 				const previous = previousByTaskId.get(summary.taskId);
 				previousByTaskId.set(summary.taskId, summary);
 				queueTaskSessionSummaryBroadcast(workspaceId, summary);
+				// Column-sync on terminal session exit. When the PTY dies
+				// (process.exit), the state machine transitions to
+				// `awaiting_review` with reviewReason `error` (non-zero
+				// exit) or `exit` (zero exit), but the board column is NOT
+				// synced because hooks-api.ts only moves cards from
+				// in_progress → review on the explicit `to_review` hook
+				// event. If the agent never emits Stop before exiting
+				// (crash, upstream 502 retry exhaustion, openclaude
+				// auto-memory then exit), the card stays stuck in
+				// in_progress forever even though the work may be done.
+				// Mirror the hooks-api to_review path here so the column
+				// reflects reality regardless of how the session ended.
+				// `attention` is included too (workspace-trust prompts in
+				// codex surface as awaiting_review without a Stop hook).
+				if (
+					previous &&
+					previous.state === "running" &&
+					summary.state === "awaiting_review" &&
+					(summary.reviewReason === "error" ||
+						summary.reviewReason === "exit" ||
+						summary.reviewReason === "attention") &&
+					deps.autoReviewManagerRef?.current
+				) {
+					const workspacePath = deps.workspaceRegistry.getWorkspacePathById(workspaceId);
+					if (workspacePath) {
+						void deps.autoReviewManagerRef.current
+							.moveTaskInProgressToReview(workspaceId, workspacePath, summary.taskId)
+							.catch(() => {
+								// Best effort; manager logs internally.
+							});
+						broadcastTaskReadyForReview(workspaceId, summary.taskId);
+					}
+				}
 				if (
 					previous &&
 					previous.state !== "interrupted" &&

@@ -54,6 +54,7 @@ import { handleHttpRequest, handleSocketUpgrade } from "./middleware";
 import type { RuntimeStateHub } from "./runtime-state-hub";
 import { createServerAutoReviewManager, type ServerAutoReviewManager } from "./server-auto-review-manager";
 import { logError } from "./server-log";
+import { resolveTwoPhasePlan } from "./two-phase";
 import type { WorkspaceRegistry } from "./workspace-registry";
 
 interface DisposeTrackedWorkspaceResult {
@@ -207,12 +208,19 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		if (!ensured.ok) {
 			throw new Error(ensured.error ?? `Could not ensure worktree for task ${taskId}`);
 		}
+		// Honor two-phase delegation: a card with planAgentId set must spawn
+		// the planner first (plan mode, planning system-prompt) and only
+		// transition to the executor after .kanban-plan.md is written.
+		// Without this, linked-task auto-start would jump straight to the
+		// executor with the raw card prompt, skipping planning entirely.
+		const twoPhase = resolveTwoPhasePlan(card, ensured.path);
+		const effectiveAgentId = twoPhase?.agentId ?? card.agentId;
 		const runtimeConfigState = await deps.workspaceRegistry.loadScopedRuntimeConfig({
 			workspaceId,
 			workspacePath,
 		});
-		const resolvedConfig = card.agentId
-			? { ...runtimeConfigState, selectedAgentId: card.agentId }
+		const resolvedConfig = effectiveAgentId
+			? { ...runtimeConfigState, selectedAgentId: effectiveAgentId }
 			: runtimeConfigState;
 		const resolved = resolveAgentCommand(resolvedConfig);
 		if (!resolved) {
@@ -226,8 +234,8 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 			args: resolved.args,
 			autonomousModeEnabled: resolvedConfig.agentAutonomousModeEnabled,
 			cwd: ensured.path,
-			prompt: card.prompt,
-			startInPlanMode: card.startInPlanMode,
+			prompt: twoPhase?.prompt ?? card.prompt,
+			startInPlanMode: twoPhase?.startInPlanMode ?? card.startInPlanMode,
 			workspaceId,
 		});
 		await mutateWorkspaceState(workspacePath, (latestState) => {
@@ -355,6 +363,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 					serverAutoReviewManager.moveTaskInProgressToReview(workspaceId, workspacePath, taskId),
 				moveTaskReviewToInProgress: (workspaceId, workspacePath, taskId) =>
 					serverAutoReviewManager.moveTaskReviewToInProgress(workspaceId, workspacePath, taskId),
+				loadScopedRuntimeConfig: deps.workspaceRegistry.loadScopedRuntimeConfig,
 			}),
 		};
 	};

@@ -32,6 +32,7 @@ const APPEND_PROMPT_AGENT_IDS: readonly RuntimeAgentId[] = [
 	"kiro",
 	"gemini",
 	"opencode",
+	"openclaude",
 ];
 
 function isRuntimeAgentId(value: string): value is RuntimeAgentId {
@@ -66,6 +67,8 @@ function renderLinearSetupGuidanceForAgent(agentId: RuntimeAgentId | null): stri
 			return "- If Linear MCP is not available in the current agent (Droid), suggest running: `droid mcp add linear https://mcp.linear.app/mcp --type http`";
 		case "kiro":
 			return "- If Linear MCP is not available in the current agent (Kiro CLI), suggest running: `kiro-cli mcp add --name linear --url https://mcp.linear.app/mcp --scope global`";
+		case "openclaude":
+			return "- If Linear MCP is not available in the current agent (OpenClaude, a Claude Code fork pointed at a local OpenAI-compatible proxy), suggest running: `openclaude mcp add --transport http --scope user linear https://mcp.linear.app/mcp`";
 		default:
 			return "- If Linear MCP is not available, provide setup instructions for the active agent only, then continue once OAuth is complete.";
 	}
@@ -193,7 +196,7 @@ Parameters:
 Purpose: create a new task in \`backlog\`, with optional plan mode and auto-review behavior.
 
 Command:
-\`${kanbanCommand} task create [--title "<text>"] --prompt "<text>" [--project-path <path>] [--base-ref <branch>] [--start-in-plan-mode <true|false>] [--auto-review-enabled <true|false>] [--auto-review-mode commit|pr]\`
+\`${kanbanCommand} task create [--title "<text>"] --prompt "<text>" [--project-path <path>] [--base-ref <branch>] [--start-in-plan-mode <true|false>] [--auto-review-enabled <true|false>] [--auto-review-mode commit|pr] [--agent-id <id>] [--plan-agent-id <id>]\`
 
 Parameters:
 - \`--title "<text>"\` optional task title. If omitted, Kanban derives one from the prompt.
@@ -203,13 +206,15 @@ Parameters:
 - \`--start-in-plan-mode <true|false>\` optional. Default false. Set true only when explicitly requested.
 - \`--auto-review-enabled <true|false>\` optional. Default false. Enables automatic action once task reaches review.
 - \`--auto-review-mode commit|pr\` optional auto-review action. Default \`commit\`.
+- \`--agent-id <id>\` optional per-card agent override. Allowed: \`cline\`, \`claude\`, \`codex\`, \`droid\`, \`gemini\`, \`opencode\`, \`openclaude\`. If omitted, uses the workspace default.
+- \`--plan-agent-id <id>\` optional planner for two-phase delegation. When set, Kanban first runs the planner in plan-mode (it writes \`.kanban-plan.md\` to the worktree, then exits via ExitPlanMode), then automatically respawns the card with \`--agent-id\` using that plan as the prompt. Same allowed values as \`--agent-id\`. See "Two-phase delegation" below.
 
 ## task update
 
 Purpose: update an existing task, including prompt, base ref, plan mode, and auto-review behavior.
 
 Command:
-\`${kanbanCommand} task update --task-id <task_id> [--title "<text>"] [--prompt "<text>"] [--project-path <path>] [--base-ref <branch>] [--start-in-plan-mode <true|false>] [--auto-review-enabled <true|false>] [--auto-review-mode commit|pr]\`
+\`${kanbanCommand} task update --task-id <task_id> [--title "<text>"] [--prompt "<text>"] [--project-path <path>] [--base-ref <branch>] [--start-in-plan-mode <true|false>] [--auto-review-enabled <true|false>] [--auto-review-mode commit|pr] [--agent-id <id>] [--plan-agent-id <id>]\`
 
 Parameters:
 - \`--task-id <task_id>\` required task ID.
@@ -220,6 +225,8 @@ Parameters:
 - \`--start-in-plan-mode <true|false>\` optional replacement of plan-mode behavior.
 - \`--auto-review-enabled <true|false>\` optional replacement of auto-review toggle. Set false to cancel pending automatic review actions.
 - \`--auto-review-mode commit|pr\` optional replacement auto-review action.
+- \`--agent-id <id>\` optional replacement per-card agent. Same values as create. Use \`default\` to clear and fall back to the workspace default.
+- \`--plan-agent-id <id>\` optional replacement planner agent for two-phase delegation. Use \`default\` to clear and turn the card back into a single-phase one.
 
 Notes:
 - Provide at least one field to change in addition to \`--task-id\`.
@@ -300,6 +307,36 @@ Parameters:
 
 - Prefer \`task list\` first when task IDs or dependency IDs are needed.
 - To create multiple linked tasks, create tasks first, then call \`task link\` for each dependency edge.
+
+# Two-phase delegation (planAgentId)
+
+This fork supports running a card in two phases within the same worktree:
+
+1. **Plan phase** — the agent passed via \`--plan-agent-id\` runs in plan mode. Kanban injects an instruction telling it to write the final implementation plan to \`.kanban-plan.md\` at the worktree root and exit via ExitPlanMode.
+2. **Execution phase** — when the planner's PTY exits and the plan file exists, Kanban automatically respawns the card with \`--agent-id\` using the plan content as the new prompt. No restart, no manual approval beyond the in-UI ExitPlanMode click.
+
+The intended use is **plan with an expensive/smart model, execute with a cheap/local one**. For example:
+
+\`\`\`
+${kanbanCommand} task create \\
+  --plan-agent-id claude \\
+  --agent-id openclaude \\
+  --prompt "Add JSDoc to every exported function in src/, then run the tests."
+\`\`\`
+
+\`openclaude\` is a Claude Code fork wrapped to point at a local OpenAI-compatible proxy serving \`opencode/qwen3.6-plus-free\` (see \`docs/openclaude-agent.md\` in the repo). The user pays the planner cost once and the executor runs on free/cheap tokens.
+
+When to suggest this pattern to the user:
+- The task is well-defined but tedious (boilerplate, mechanical refactors, doc strings, repetitive test scaffolding).
+- They've mentioned cost concerns or want to use a smaller model.
+- They explicitly ask to "plan with Opus and execute with X".
+
+When NOT to suggest:
+- Single quick changes (overhead of two PTYs and a plan file is not worth it).
+- Architectural design work where the executor's judgement matters as much as the planner's.
+- Tasks that need iterative debugging (qwen-tier executors will often need handholding).
+
+If the user only mentions one agent (just \`--agent-id\`), do not invent a planner — only use \`--plan-agent-id\` when they ask for it or when the task fits the pattern above and you've checked with them.
 `;
 }
 

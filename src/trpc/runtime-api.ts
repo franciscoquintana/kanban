@@ -3,7 +3,7 @@
 // workspace actions, but detailed Cline, terminal, and config behavior
 // should stay in focused services instead of accumulating here.
 
-import { rm } from "node:fs/promises";
+import { readFile, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { TRPCError } from "@trpc/server";
@@ -15,8 +15,11 @@ import type { ClineTaskSessionService } from "../cline-sdk/cline-task-session-se
 import type { RuntimeConfigState } from "../config/runtime-config";
 import { updateGlobalRuntimeConfig, updateRuntimeConfig } from "../config/runtime-config";
 import type {
+	RuntimeAgentId,
 	RuntimeCommandRunResponse,
 	RuntimeRunUpdateResponse,
+	RuntimeTaskPlanFileRequest,
+	RuntimeTaskPlanFileResponse,
 	RuntimeUpdateStatusResponse,
 } from "../core/api-contract";
 import {
@@ -44,9 +47,11 @@ import {
 import { isHomeAgentSessionId } from "../core/home-agent-session";
 import { resolveTaskTitle } from "../core/task-title.js";
 import { openInBrowser } from "../server/browser";
+import { PLAN_FILE_NAME, resolveTwoPhasePlan } from "../server/two-phase";
+import { loadWorkspaceBoardById } from "../state/workspace-state";
 import { buildRuntimeConfigResponse, resolveAgentCommand } from "../terminal/agent-registry";
 import type { TerminalSessionManager } from "../terminal/session-manager";
-import { resolveTaskCwd } from "../workspace/task-worktree";
+import { getTaskWorkspacePathInfo, resolveTaskCwd } from "../workspace/task-worktree";
 import { captureTaskTurnCheckpoint } from "../workspace/turn-checkpoints";
 import type { RuntimeTrpcContext, RuntimeTrpcWorkspaceScope } from "./app-router";
 
@@ -199,7 +204,38 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				const previousTerminalAgentId = body.resumeFromTrash
 					? (terminalManager.getSummary(body.taskId)?.agentId ?? null)
 					: null;
-				const effectiveAgentId = previousTerminalAgentId ?? body.agentId ?? scopedRuntimeConfig.selectedAgentId;
+
+				// Two-phase delegation: when the card has planAgentId, resolve
+				// which phase to run BEFORE the normal agentId precedence so
+				// that UI-initiated `task start` triggers the planner first
+				// (auto-resume on boot already does this; without this branch
+				// the UI path silently skipped the planner and went straight
+				// to the executor).
+				let twoPhaseAgentId: RuntimeAgentId | null = null;
+				let twoPhasePrompt: string | null = null;
+				let twoPhaseStartInPlanMode: boolean | null = null;
+				if (!body.resumeFromTrash && !isHomeAgentSessionId(body.taskId)) {
+					try {
+						const board = await loadWorkspaceBoardById(workspaceScope.workspaceId);
+						const card = board?.columns.flatMap((column) => column.cards).find((c) => c.id === body.taskId);
+						if (card?.planAgentId) {
+							const next = resolveTwoPhasePlan(card, taskCwd);
+							if (next) {
+								twoPhaseAgentId = next.agentId;
+								twoPhasePrompt = next.prompt;
+								twoPhaseStartInPlanMode = next.startInPlanMode;
+							}
+						}
+					} catch {
+						// Best effort: any failure here falls back to the normal
+						// agent precedence below.
+					}
+				}
+
+				const effectiveAgentId =
+					twoPhaseAgentId ?? previousTerminalAgentId ?? body.agentId ?? scopedRuntimeConfig.selectedAgentId;
+				const effectivePrompt = twoPhasePrompt ?? body.prompt;
+				const effectiveStartInPlanMode = twoPhaseStartInPlanMode ?? body.startInPlanMode;
 				let useClinePath = effectiveAgentId === "cline";
 				const shouldProbePersistedClineSession =
 					body.resumeFromTrash && !useClinePath && previousTerminalAgentId === null;
@@ -232,14 +268,14 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					const summary = await clineTaskSessionService.startTaskSession({
 						taskId: body.taskId,
 						cwd: taskCwd,
-						prompt: body.prompt,
+						prompt: effectivePrompt,
 						taskTitle: resolvedClineTitle.length > 0 ? resolvedClineTitle : undefined,
 						images: body.images,
 						resumeFromTrash: body.resumeFromTrash,
 						providerId: clineLaunchConfig.providerId,
 						modelId: clineLaunchConfig.modelId,
 						mode: requestedClineTaskMode,
-						startInPlanMode: body.startInPlanMode,
+						startInPlanMode: effectiveStartInPlanMode,
 						apiKey: clineLaunchConfig.apiKey,
 						baseUrl: clineLaunchConfig.baseUrl,
 						reasoningEffort: clineLaunchConfig.reasoningEffort,
@@ -285,9 +321,9 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					args: resolved.args,
 					autonomousModeEnabled: scopedRuntimeConfig.agentAutonomousModeEnabled,
 					cwd: taskCwd,
-					prompt: body.prompt,
+					prompt: effectivePrompt,
 					images: body.images,
-					startInPlanMode: body.startInPlanMode,
+					startInPlanMode: effectiveStartInPlanMode,
 					resumeFromTrash: body.resumeFromTrash,
 					cols: body.cols,
 					rows: body.rows,
@@ -360,7 +396,44 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					};
 				}
 				const terminalManager = await deps.getScopedTerminalManager(workspaceScope);
-				const summary = terminalManager.writeInput(body.taskId, Buffer.from(payloadText, "utf8"));
+				let summary = terminalManager.writeInput(body.taskId, Buffer.from(payloadText, "utf8"));
+				if (!summary) {
+					// openclaude exits its PTY when the agent loop finishes, so by
+					// the time the user clicks Commit/Open PR the session is gone
+					// and writeInput returns null. For openclaude cards, respawn
+					// the agent with the incoming text as the new task prompt so
+					// the commit/PR flow still works.
+					const board = await loadWorkspaceBoardById(workspaceScope.workspaceId);
+					const card = board?.columns.flatMap((column) => column.cards).find((c) => c.id === body.taskId);
+					if (card?.agentId === "openclaude") {
+						const pathInfo = await getTaskWorkspacePathInfo({
+							cwd: workspaceScope.workspacePath,
+							taskId: body.taskId,
+							baseRef: card.baseRef,
+						});
+						if (pathInfo.exists) {
+							const runtimeConfig = await deps.loadScopedRuntimeConfig(workspaceScope);
+							const resolvedConfig: RuntimeConfigState =
+								runtimeConfig.selectedAgentId === "openclaude"
+									? runtimeConfig
+									: { ...runtimeConfig, selectedAgentId: "openclaude" as const };
+							const resolved = resolveAgentCommand(resolvedConfig);
+							if (resolved) {
+								summary = await terminalManager.startTaskSession({
+									taskId: body.taskId,
+									agentId: resolved.agentId,
+									binary: resolved.binary,
+									args: resolved.args,
+									autonomousModeEnabled: resolvedConfig.agentAutonomousModeEnabled,
+									cwd: pathInfo.path,
+									prompt: payloadText.replace(/\r?\n?$/, ""),
+									startInPlanMode: false,
+									workspaceId: workspaceScope.workspaceId,
+								});
+							}
+						}
+					}
+				}
 				if (!summary) {
 					return {
 						ok: false,
@@ -405,6 +478,30 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					messages: [],
 					error: message,
 				};
+			}
+		},
+		getTaskPlanFile: async (
+			workspaceScope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskPlanFileRequest,
+		): Promise<RuntimeTaskPlanFileResponse> => {
+			const taskId = String(input.taskId ?? "").trim();
+			if (!taskId) return { exists: false };
+			const board = await loadWorkspaceBoardById(workspaceScope.workspaceId);
+			const card = board?.columns.flatMap((column) => column.cards).find((c) => c.id === taskId);
+			if (!card) return { exists: false };
+			const pathInfo = await getTaskWorkspacePathInfo({
+				cwd: workspaceScope.workspacePath,
+				taskId,
+				baseRef: card.baseRef,
+			});
+			if (!pathInfo.exists) return { exists: false };
+			const filePath = join(pathInfo.path, PLAN_FILE_NAME);
+			try {
+				const st = await stat(filePath);
+				const content = await readFile(filePath, "utf8");
+				return { exists: true, content, modifiedAt: st.mtimeMs };
+			} catch {
+				return { exists: false };
 			}
 		},
 		getClineSlashCommands: async (workspaceScope) => {

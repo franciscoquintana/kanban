@@ -8,6 +8,7 @@ import { ClineAgentChatPanel, type ClineAgentChatPanelHandle } from "@/component
 import { ColumnContextPanel } from "@/components/detail-panels/column-context-panel";
 import { type DiffLineComment, DiffViewerPanel } from "@/components/detail-panels/diff-viewer-panel";
 import { FileTreePanel } from "@/components/detail-panels/file-tree-panel";
+import { PlanArtifactPanel } from "@/components/detail-panels/plan-artifact-panel";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/components/ui/cn";
 import type { ClineChatActionResult } from "@/hooks/use-cline-chat-runtime-actions";
@@ -669,36 +670,49 @@ export function CardDetailView({
 			}
 		/>
 	) : (
-		<AgentTerminalPanel
-			taskId={selection.card.id}
-			workspaceId={currentProjectId}
-			terminalEnabled={isTaskTerminalEnabled}
-			summary={sessionSummary}
-			onSummary={onSessionSummary}
-			onCommit={onAgentCommitTask ? () => onAgentCommitTask(selection.card.id) : undefined}
-			onOpenPr={onAgentOpenPrTask ? () => onAgentOpenPrTask(selection.card.id) : undefined}
-			isCommitLoading={agentCommitTaskLoadingById?.[selection.card.id] ?? false}
-			isOpenPrLoading={agentOpenPrTaskLoadingById?.[selection.card.id] ?? false}
-			showSessionToolbar={false}
-			autoFocus
-			showMoveToTrash={showMoveToTrashActions}
-			onMoveToTrash={onMoveToTrash}
-			isMoveToTrashLoading={isMoveToTrashLoading}
-			onCancelAutomaticAction={
-				selection.card.autoReviewEnabled === true && onCancelAutomaticTaskAction
-					? () => onCancelAutomaticTaskAction(selection.card.id)
-					: undefined
-			}
-			cancelAutomaticActionLabel={
-				selection.card.autoReviewEnabled === true
-					? getTaskAutoReviewCancelButtonLabel(selection.card.autoReviewMode)
-					: null
-			}
-			panelBackgroundColor="var(--color-surface-0)"
-			terminalBackgroundColor={terminalThemeColors.surfacePrimary}
-			cursorColor={terminalThemeColors.textPrimary}
-			taskColumnId={selection.column.id}
-		/>
+		<div className="flex min-h-0 min-w-0 flex-1 flex-col">
+			{selection.card.planAgentId && currentProjectId ? (
+				<PlanArtifactPanel
+					taskId={selection.card.id}
+					workspaceId={currentProjectId}
+					isCardActive={
+						sessionSummary?.state === "running" ||
+						sessionSummary?.state === "awaiting_review" ||
+						sessionSummary?.state === "idle"
+					}
+				/>
+			) : null}
+			<AgentTerminalPanel
+				taskId={selection.card.id}
+				workspaceId={currentProjectId}
+				terminalEnabled={isTaskTerminalEnabled}
+				summary={sessionSummary}
+				onSummary={onSessionSummary}
+				onCommit={onAgentCommitTask ? () => onAgentCommitTask(selection.card.id) : undefined}
+				onOpenPr={onAgentOpenPrTask ? () => onAgentOpenPrTask(selection.card.id) : undefined}
+				isCommitLoading={agentCommitTaskLoadingById?.[selection.card.id] ?? false}
+				isOpenPrLoading={agentOpenPrTaskLoadingById?.[selection.card.id] ?? false}
+				showSessionToolbar={false}
+				autoFocus
+				showMoveToTrash={showMoveToTrashActions}
+				onMoveToTrash={onMoveToTrash}
+				isMoveToTrashLoading={isMoveToTrashLoading}
+				onCancelAutomaticAction={
+					selection.card.autoReviewEnabled === true && onCancelAutomaticTaskAction
+						? () => onCancelAutomaticTaskAction(selection.card.id)
+						: undefined
+				}
+				cancelAutomaticActionLabel={
+					selection.card.autoReviewEnabled === true
+						? getTaskAutoReviewCancelButtonLabel(selection.card.autoReviewMode)
+						: null
+				}
+				panelBackgroundColor="var(--color-surface-0)"
+				terminalBackgroundColor={terminalThemeColors.surfacePrimary}
+				cursorColor={terminalThemeColors.textPrimary}
+				taskColumnId={selection.column.id}
+			/>
+		</div>
 	);
 
 	if (isMobile) {

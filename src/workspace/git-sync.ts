@@ -1,5 +1,5 @@
-import { readFile, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { lstat, readFile, readlink, stat } from "node:fs/promises";
+import { isAbsolute, join, resolve } from "node:path";
 
 import type {
 	RuntimeGitCheckoutResponse,
@@ -8,7 +8,22 @@ import type {
 	RuntimeGitSyncResponse,
 	RuntimeGitSyncSummary,
 } from "../core/api-contract";
+import { BG_ACTIVE_FILE_NAME, NEEDS_INPUT_FILE_NAME, PLAN_FILE_NAME } from "../server/two-phase";
 import { runGit } from "./git-utils";
+
+// Kanban runtime sentinels that should NEVER count toward changedFiles.
+// These are kanban-internal artifacts (per-task plan, "agent needs user input"
+// marker) — counting them poisons the auto-review state machine:
+//   * if they appear untracked, evaluate() never disarms ("agent still has
+//     pending work")
+//   * if they appear as deletions of a tracked file (legacy: T15 leaked
+//     .kanban-plan.md into a commit), evaluate() fires the commit prompt at
+//     a planner that can't commit in plan mode, leaving the card stuck
+const KANBAN_RUNTIME_SENTINELS: ReadonlySet<string> = new Set([
+	PLAN_FILE_NAME,
+	NEEDS_INPUT_FILE_NAME,
+	BG_ACTIVE_FILE_NAME,
+]);
 
 /**
  * Resolve the tip commit SHA of a local branch in `repoPath`. Returns `null`
@@ -32,6 +47,30 @@ export async function getBranchTip(repoPath: string, baseRef: string): Promise<s
 	return sha.length > 0 ? sha : null;
 }
 
+/**
+ * Count commits reachable from HEAD that are NOT reachable from baseRef
+ * (i.e. local commits in the worktree that have not been merged/cherry-picked
+ * onto baseRef yet). Returns null if the command fails (worktree missing,
+ * baseRef missing, etc.).
+ *
+ * Used by server-auto-review-manager.evaluate() to detect "agent committed
+ * locally but did not cherry-pick onto baseRef" — the auto-review state
+ * machine would otherwise never arm (changedFiles=0 looks idle) and the
+ * card sits stuck in review forever even though there's work to ship.
+ */
+export async function countCommitsAheadOfBaseRef(worktreePath: string, baseRef: string): Promise<number | null> {
+	const trimmed = baseRef.trim();
+	if (!trimmed) {
+		return null;
+	}
+	const result = await runGit(worktreePath, ["rev-list", "--count", `${trimmed}..HEAD`]);
+	if (!result.ok) {
+		return null;
+	}
+	const n = Number.parseInt(result.stdout.trim(), 10);
+	return Number.isFinite(n) ? n : null;
+}
+
 interface GitPathFingerprint {
 	path: string;
 	size: number | null;
@@ -49,6 +88,25 @@ export interface GitWorkspaceProbe {
 	changedFiles: number;
 	untrackedPaths: string[];
 	stateToken: string;
+}
+
+async function isSymlinkOutsideWorktree(worktreeRoot: string, relativePath: string): Promise<boolean> {
+	try {
+		const absPath = join(worktreeRoot, relativePath);
+		const st = await lstat(absPath);
+		if (!st.isSymbolicLink()) {
+			return false;
+		}
+		const raw = await readlink(absPath);
+		const target = isAbsolute(raw) ? raw : resolve(absPath, "..", raw);
+		const rootResolved = resolve(worktreeRoot);
+		// Symlink is "inside" the worktree iff its resolved target is at or
+		// beneath the worktree root. Anything else (sibling worktrees, base
+		// workspace, /tmp, ...) is outside.
+		return !(target === rootResolved || target.startsWith(`${rootResolved}/`));
+	} catch {
+		return false;
+	}
 }
 
 function countLines(text: string): number {
@@ -176,6 +234,18 @@ export async function probeGitWorkspaceState(cwd: string): Promise<GitWorkspaceP
 			if (!path) {
 				continue;
 			}
+			if (KANBAN_RUNTIME_SENTINELS.has(path)) {
+				continue;
+			}
+			if (await isSymlinkOutsideWorktree(repoRoot, path)) {
+				// Worktree setup occasionally leaves stale symlinks pointing
+				// into the base workspace (e.g. __pycache__/ created before a
+				// rename moved the parent dir). git refuses to evaluate
+				// .gitignore "beyond a symbolic link", so these show up as
+				// untracked forever and poison auto-review's changedFiles
+				// count, leaving cards stuck after the commit lands.
+				continue;
+			}
 			changedFiles += 1;
 			untrackedPaths.push(path);
 			fingerprintPaths.push(path);
@@ -184,6 +254,9 @@ export async function probeGitWorkspaceState(cwd: string): Promise<GitWorkspaceP
 		if (line.startsWith("1 ") || line.startsWith("2 ") || line.startsWith("u ")) {
 			const path = parseStatusPath(line);
 			if (!path) {
+				continue;
+			}
+			if (KANBAN_RUNTIME_SENTINELS.has(path)) {
 				continue;
 			}
 			changedFiles += 1;

@@ -21,6 +21,7 @@ export interface RuntimeCreateTaskInput {
 	autoReviewMode?: RuntimeTaskAutoReviewMode;
 	images?: RuntimeTaskImage[];
 	agentId?: RuntimeAgentId;
+	planAgentId?: RuntimeAgentId;
 	clineSettings?: RuntimeTaskClineSettings;
 	baseRef: string;
 }
@@ -33,6 +34,7 @@ export interface RuntimeUpdateTaskInput {
 	autoReviewMode?: RuntimeTaskAutoReviewMode;
 	images?: RuntimeTaskImage[];
 	agentId?: RuntimeAgentId | null;
+	planAgentId?: RuntimeAgentId | null;
 	clineSettings?: RuntimeTaskClineSettings | null;
 	baseRef: string;
 }
@@ -211,7 +213,15 @@ function getLinkedBacklogTaskIdsReadyAfterTaskTrashed(
 	taskId: string,
 	fromColumnId: RuntimeBoardColumnId | null,
 ): string[] {
-	if (!taskId || board.dependencies.length === 0 || fromColumnId !== "review") {
+	// Allow auto-start to fire from any non-trash origin column. The original
+	// upstream check `fromColumnId === "review"` assumed the only way a card
+	// reaches trash is via the user moving it from review → done; our server-
+	// side auto-review can trash from `in_progress` too (the commit prompt
+	// path oscillates review ↔ in_progress and the move-to-trash decision
+	// often fires while the card is in_progress because PreToolUse just
+	// re-engaged it). Without this relaxation, linked successors never
+	// auto-start when an auto-review pipeline completes.
+	if (!taskId || board.dependencies.length === 0 || fromColumnId === "trash" || fromColumnId === null) {
 		return [];
 	}
 	const readyTaskIds = new Set<string>();
@@ -219,10 +229,34 @@ function getLinkedBacklogTaskIdsReadyAfterTaskTrashed(
 		if (dependency.toTaskId !== taskId) {
 			continue;
 		}
-		if (getTaskColumnId(board, dependency.fromTaskId) !== "backlog") {
+		const successorId = dependency.fromTaskId;
+		if (getTaskColumnId(board, successorId) !== "backlog") {
 			continue;
 		}
-		readyTaskIds.add(dependency.fromTaskId);
+		// Only mark the successor as ready if ALL of its other prerequisites
+		// are also satisfied (in trash, done, or already removed from the
+		// board). Without this check, fan-in successors (a card that
+		// depends on N>1 other cards, e.g. a gate task) would auto-start
+		// as soon as ANY one of its prerequisites trashes — leaving the
+		// other prerequisites still in progress and effectively skipping
+		// the gate.
+		let allPrerequisitesSatisfied = true;
+		for (const otherDep of board.dependencies) {
+			if (otherDep.fromTaskId !== successorId) continue;
+			// The prerequisite that just triggered this call is satisfied
+			// by definition (the trash move happens right after this
+			// function returns).
+			if (otherDep.toTaskId === taskId) continue;
+			const blockerColumn = getTaskColumnId(board, otherDep.toTaskId);
+			const blockerDone = blockerColumn === null || blockerColumn === "trash";
+			if (!blockerDone) {
+				allPrerequisitesSatisfied = false;
+				break;
+			}
+		}
+		if (allPrerequisitesSatisfied) {
+			readyTaskIds.add(successorId);
+		}
 	}
 	return [...readyTaskIds];
 }
@@ -309,6 +343,7 @@ export function addTaskToColumn(
 		autoReviewMode: normalizeTaskAutoReviewMode(input.autoReviewMode),
 		images: cloneTaskImages(input.images),
 		...(input.agentId ? { agentId: input.agentId } : {}),
+		...(input.planAgentId ? { planAgentId: input.planAgentId } : {}),
 		...(input.clineSettings !== undefined ? { clineSettings: cloneTaskClineSettings(input.clineSettings) } : {}),
 		baseRef,
 		createdAt: now,
@@ -625,6 +660,7 @@ export function updateTask(
 				autoReviewMode: normalizeTaskAutoReviewMode(input.autoReviewMode),
 				images: input.images === undefined ? card.images : cloneTaskImages(input.images),
 				agentId: input.agentId === undefined ? card.agentId : (input.agentId ?? undefined),
+				planAgentId: input.planAgentId === undefined ? card.planAgentId : (input.planAgentId ?? undefined),
 				clineSettings:
 					input.clineSettings === undefined
 						? cloneTaskClineSettings(card.clineSettings)

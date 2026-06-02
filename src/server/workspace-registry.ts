@@ -6,16 +6,21 @@ import type {
 	RuntimeProjectTaskCounts,
 	RuntimeWorkspaceStateResponse,
 } from "../core/api-contract";
+import { moveTaskToColumn } from "../core/task-board-mutations";
 import {
 	listWorkspaceIndexEntries,
 	loadWorkspaceBoardById,
 	loadWorkspaceContext,
 	loadWorkspaceState,
+	mutateWorkspaceState,
 	type RuntimeWorkspaceIndexEntry,
 	removeWorkspaceIndexEntry,
 	removeWorkspaceStateFiles,
 } from "../state/workspace-state";
+import { resolveAgentCommand } from "../terminal/agent-registry";
 import { TerminalSessionManager } from "../terminal/session-manager";
+import { getTaskWorkspacePathInfo } from "../workspace/task-worktree";
+import { resolveTwoPhasePlan } from "./two-phase";
 
 export interface WorkspaceRegistryScope {
 	workspaceId: string;
@@ -234,7 +239,88 @@ export async function createWorkspaceRegistry(deps: CreateWorkspaceRegistryDepen
 			return loaded;
 		}
 		const loading = (async () => {
-			const manager = new TerminalSessionManager();
+			// Lazy `manager` binding so the onSessionExited closure can call
+			// back into the same manager once it's been created below.
+			let createdManager: TerminalSessionManager;
+			const manager = new TerminalSessionManager({
+				onSessionExited: (taskId, summary) => {
+					// Two-phase delegation handoff: when the planner agent's
+					// PTY exits and `.kanban-plan.md` exists in the worktree,
+					// respawn the same card with the executor agent and the
+					// plan content as prompt. We do this here (not just in
+					// the to_review hook) because claude exits fast after
+					// ExitPlanMode — the Stop hook often races the teardown
+					// and `canTransitionTaskForHookEvent` blocks it.
+					void (async () => {
+						try {
+							const board = await loadWorkspaceBoardById(workspaceId);
+							const card = board?.columns.flatMap((column) => column.cards).find((c) => c.id === taskId);
+							if (!card?.planAgentId) return;
+							if (summary.agentId !== card.planAgentId) return;
+							const pathInfo = await getTaskWorkspacePathInfo({
+								cwd: repoPath,
+								taskId,
+								baseRef: card.baseRef,
+							});
+							if (!pathInfo.exists) return;
+							const next = resolveTwoPhasePlan(card, pathInfo.path);
+							if (!next || next.phase !== "exec") return;
+							const runtimeConfig = await deps.loadRuntimeConfig(repoPath);
+							const resolvedConfig =
+								runtimeConfig.selectedAgentId === next.agentId
+									? runtimeConfig
+									: { ...runtimeConfig, selectedAgentId: next.agentId };
+							const resolved = resolveAgentCommand(resolvedConfig);
+							if (!resolved) return;
+							await createdManager.startTaskSession({
+								taskId,
+								agentId: resolved.agentId,
+								binary: resolved.binary,
+								args: resolved.args,
+								autonomousModeEnabled: resolvedConfig.agentAutonomousModeEnabled,
+								cwd: pathInfo.path,
+								prompt: next.prompt,
+								startInPlanMode: next.startInPlanMode,
+								workspaceId,
+							});
+							// Persist the executor's session record to disk and move the
+							// card back to in_progress. Two distinct bugs without this:
+							//   1. The planner's Stop hook likely already moved the card
+							//      to review (hooks-api.ts) and possibly armed auto-review.
+							//      Until the executor emits a fresh PreToolUse, the UI
+							//      shows Review with the auto-commit prompt visible — yet
+							//      the executor PTY is silently running. Move the card
+							//      back so the user sees the correct state immediately.
+							//   2. `startTaskSession` only updates the manager's in-memory
+							//      entry. sessions.json on disk still references the
+							//      planner agent (or has no entry at all if the planner
+							//      session never persisted). On the next kanban restart
+							//      auto-resume reads sessions.json, can't find the live
+							//      executor, and either spawns a fresh session (losing
+							//      the executor's chat history) or shows it as stopped.
+							const executorSummary = createdManager.getSummary(taskId);
+							if (executorSummary) {
+								try {
+									await mutateWorkspaceState(repoPath, (latestState) => {
+										const movement = moveTaskToColumn(latestState.board, taskId, "in_progress", Date.now());
+										const nextBoard = movement.moved ? movement.board : latestState.board;
+										const nextSessions = { ...latestState.sessions, [taskId]: executorSummary };
+										return { board: nextBoard, sessions: nextSessions, value: {} };
+									});
+								} catch {
+									// Best effort: persistence failure should not abort the
+									// handoff. The executor is already running; the worst
+									// case is sessions.json staleness until the next state
+									// mutation flushes it.
+								}
+							}
+						} catch {
+							// Best effort: log via console? swallow for now.
+						}
+					})();
+				},
+			});
+			createdManager = manager;
 			try {
 				const existingWorkspace = await loadWorkspaceState(repoPath);
 				manager.hydrateFromRecord(existingWorkspace.sessions);

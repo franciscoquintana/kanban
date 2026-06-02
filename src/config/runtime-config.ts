@@ -64,7 +64,7 @@ const DEFAULT_COMMIT_PROMPT_TEMPLATE = `You are in a worktree on a detached HEAD
 - Preserve any pre-existing user uncommitted changes in the base worktree.
 
 Steps:
-1. In the current task worktree, stage and create a commit for the pending task changes.
+1. In the current task worktree, stage and create a commit for the pending task changes. **Do NOT stage \`.kanban-plan.md\`, \`.kanban-needs-input\`, or \`.kanban-bg-active\`** — these are kanban runtime sentinels, not project files; committing them poisons downstream task worktrees that inherit the branch tip. Run \`git add -A -- ':!.kanban-plan.md' ':!.kanban-needs-input' ':!.kanban-bg-active'\` (or stage individual paths explicitly) so they stay out of the commit.
 2. Find where {{base_ref}} is checked out:
    - Run: git worktree list --porcelain
    - If branch {{base_ref}} is checked out in path P, use that P.

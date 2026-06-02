@@ -148,6 +148,16 @@ export const runtimeBoardCardSchema = z
 		autoReviewMode: runtimeTaskAutoReviewModeSchema.optional(),
 		images: z.array(runtimeTaskImageSchema).optional(),
 		agentId: runtimeAgentIdSchema.optional(),
+		// When set, this card runs in two phases:
+		//   1. `planAgentId` (e.g. claude) is spawned in plan mode with an
+		//      injected system prompt instructing it to write the final plan
+		//      to `.kanban-plan.md` inside the worktree and exit plan mode.
+		//   2. When the plan-phase PTY ends and `.kanban-plan.md` exists,
+		//      kanban automatically respawns the card with `agentId` (e.g.
+		//      openclaude) using the plan file content as the new prompt.
+		// If no plan file is produced, the card falls through to review as
+		// usual — no second phase.
+		planAgentId: runtimeAgentIdSchema.optional(),
 		clineSettings: runtimeTaskClineSettingsSchema.optional(),
 		clineProviderId: z.string().optional(),
 		clineModelId: z.string().optional(),
@@ -1116,6 +1126,24 @@ export const runtimeTaskChatMessagesResponseSchema = z.object({
 	error: z.string().optional(),
 });
 export type RuntimeTaskChatMessagesResponse = z.infer<typeof runtimeTaskChatMessagesResponseSchema>;
+
+// Two-phase delegation: lets the UI fetch the `.kanban-plan.md` artefact a
+// planner agent wrote inside the task worktree, so the card can render the
+// plan alongside the live exec PTY without needing PTY history replay.
+export const runtimeTaskPlanFileRequestSchema = z.object({
+	taskId: z.string(),
+});
+export type RuntimeTaskPlanFileRequest = z.infer<typeof runtimeTaskPlanFileRequestSchema>;
+
+export const runtimeTaskPlanFileResponseSchema = z.union([
+	z.object({ exists: z.literal(false) }),
+	z.object({
+		exists: z.literal(true),
+		content: z.string(),
+		modifiedAt: z.number(),
+	}),
+]);
+export type RuntimeTaskPlanFileResponse = z.infer<typeof runtimeTaskPlanFileResponseSchema>;
 
 export const runtimeTaskChatSendRequestSchema = z.object({
 	taskId: z.string(),

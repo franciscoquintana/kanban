@@ -352,6 +352,7 @@ function formatTaskRecord(
 		autoReviewEnabled: task.autoReviewEnabled === true,
 		autoReviewMode: task.autoReviewMode ?? "commit",
 		...(task.agentId ? { agentId: task.agentId } : {}),
+		...(task.planAgentId ? { planAgentId: task.planAgentId } : {}),
 		...formatTaskClineSettings(task.clineSettings),
 		createdAt: task.createdAt,
 		updatedAt: task.updatedAt,
@@ -482,6 +483,7 @@ async function createTask(input: {
 	autoReviewEnabled?: boolean;
 	autoReviewMode?: "commit" | "pr";
 	agentId?: RuntimeAgentId;
+	planAgentId?: RuntimeAgentId;
 	clineSettings?: RuntimeTaskClineSettings;
 }): Promise<JsonRecord> {
 	const workspaceRepoPath = await resolveWorkspaceRepoPath(input.projectPath, input.cwd);
@@ -502,6 +504,7 @@ async function createTask(input: {
 				autoReviewEnabled: input.autoReviewEnabled,
 				autoReviewMode: input.autoReviewMode,
 				agentId: input.agentId,
+				planAgentId: input.planAgentId,
 				clineSettings: input.clineSettings,
 				baseRef: resolvedBaseRef,
 			},
@@ -526,6 +529,7 @@ async function createTask(input: {
 			autoReviewEnabled: created.autoReviewEnabled === true,
 			autoReviewMode: created.autoReviewMode ?? "commit",
 			...(created.agentId ? { agentId: created.agentId } : {}),
+			...(created.planAgentId ? { planAgentId: created.planAgentId } : {}),
 			...formatTaskClineSettings(created.clineSettings),
 		},
 	};
@@ -542,6 +546,7 @@ async function updateTaskCommand(input: {
 	autoReviewEnabled?: boolean;
 	autoReviewMode?: "commit" | "pr";
 	agentId?: RuntimeAgentId | null;
+	planAgentId?: RuntimeAgentId | null;
 	clineProviderId?: string | null;
 	clineModelId?: string | null;
 	clineReasoningEffort?: ParsedTaskClineReasoningEffort;
@@ -554,6 +559,7 @@ async function updateTaskCommand(input: {
 		input.autoReviewEnabled === undefined &&
 		input.autoReviewMode === undefined &&
 		input.agentId === undefined &&
+		input.planAgentId === undefined &&
 		input.clineProviderId === undefined &&
 		input.clineModelId === undefined &&
 		input.clineReasoningEffort === undefined
@@ -583,6 +589,7 @@ async function updateTaskCommand(input: {
 			autoReviewEnabled: input.autoReviewEnabled ?? taskRecord.task.autoReviewEnabled === true,
 			autoReviewMode: input.autoReviewMode ?? taskRecord.task.autoReviewMode ?? "commit",
 			agentId: input.agentId,
+			planAgentId: input.planAgentId,
 			clineSettings: nextTaskClineSettings,
 		});
 		if (!updatedTask.updated || !updatedTask.task) {
@@ -1140,6 +1147,10 @@ export function registerTaskCommand(program: Command): void {
 			"Agent override: cline | claude | codex | droid | gemini | opencode | openclaude | default.",
 		)
 		.option(
+			"--plan-agent-id <id>",
+			"Optional planning agent. When set, kanban first runs this agent in plan mode (instructed to write `.kanban-plan.md`); on exit, automatically respawns the card with --agent-id using that file as the prompt. Same values as --agent-id.",
+		)
+		.option(
 			"--cline-provider <id>",
 			'Cline provider override (e.g. anthropic, openai, cline). Use "default" for workspace default.',
 		)
@@ -1161,6 +1172,7 @@ export function registerTaskCommand(program: Command): void {
 				autoReviewEnabled?: unknown;
 				autoReviewMode?: "commit" | "pr";
 				agentId?: string;
+				planAgentId?: string;
 				clineProvider?: string;
 				clineModel?: string;
 				clineReasoningEffort?: string;
@@ -1177,6 +1189,7 @@ export function registerTaskCommand(program: Command): void {
 							autoReviewEnabled: parseOptionalBooleanOption(options.autoReviewEnabled, "--auto-review-enabled"),
 							autoReviewMode: options.autoReviewMode,
 							agentId: parseAgentId(options.agentId) ?? undefined,
+							planAgentId: parseAgentId(options.planAgentId) ?? undefined,
 							clineSettings: buildTaskClineSettingsForCreate({
 								providerId: parseOptionalStringOrDefault(options.clineProvider) ?? undefined,
 								modelId: parseOptionalStringOrDefault(options.clineModel) ?? undefined,
@@ -1203,6 +1216,10 @@ export function registerTaskCommand(program: Command): void {
 			'Agent override: cline | claude | codex | droid | gemini | opencode | openclaude. Use "default" to clear.',
 		)
 		.option(
+			"--plan-agent-id <id>",
+			'Optional planner agent for two-phase cards. Same values as --agent-id. Use "default" to clear.',
+		)
+		.option(
 			"--cline-provider <id>",
 			'Cline provider override (e.g. anthropic, openai, cline). Use "default" to clear.',
 		)
@@ -1222,6 +1239,7 @@ export function registerTaskCommand(program: Command): void {
 				autoReviewEnabled?: unknown;
 				autoReviewMode?: "commit" | "pr";
 				agentId?: string;
+				planAgentId?: string;
 				clineProvider?: string;
 				clineModel?: string;
 				clineReasoningEffort?: string;
@@ -1235,6 +1253,7 @@ export function registerTaskCommand(program: Command): void {
 							projectPath: options.projectPath,
 							prompt: options.prompt,
 							baseRef: options.baseRef,
+							planAgentId: parseAgentId(options.planAgentId),
 							startInPlanMode: parseOptionalBooleanOption(options.startInPlanMode, "--start-in-plan-mode"),
 							autoReviewEnabled: parseOptionalBooleanOption(options.autoReviewEnabled, "--auto-review-enabled"),
 							autoReviewMode: options.autoReviewMode,

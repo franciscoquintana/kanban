@@ -23,6 +23,8 @@
 //
 // See `.plan/docs/fork-server-side-auto-review.md`.
 
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import type { ClineTaskSessionService } from "../cline-sdk/cline-task-session-service.js";
 import type {
 	RuntimeBoardData,
@@ -38,8 +40,10 @@ import { buildTaskGitActionPrompt, type TaskGitAction } from "../git-actions/bui
 import { isNativeClineAgentSelected } from "../runtime/native-agent.js";
 import { loadWorkspaceBoardById, mutateWorkspaceState } from "../state/workspace-state.js";
 import type { TerminalSessionManager } from "../terminal/session-manager.js";
-import { getBranchTip } from "../workspace/git-sync.js";
+import { countCommitsAheadOfBaseRef, getBranchTip } from "../workspace/git-sync.js";
+import { getTaskWorkspacePathInfo } from "../workspace/task-worktree.js";
 import { logError, logInfo, logWarn } from "./server-log.js";
+import { BG_ACTIVE_FILE_NAME, NEEDS_INPUT_FILE_NAME } from "./two-phase.js";
 
 const ACTION_DEBOUNCE_MS = 500;
 
@@ -88,6 +92,12 @@ interface PendingEntry {
 	scheduledAction: ScheduledAction | null;
 	actionTimer: NodeJS.Timeout | null;
 	moveToTrashInFlight: boolean;
+	// True if `armed` was restored from a persisted arm record at register
+	// time (kanban-restart recovery). The original commit prompt was
+	// dispatched to a PTY that may no longer be alive — when evaluate sees
+	// changedFiles>0 we must re-dispatch instead of waiting forever for the
+	// agent to act on a prompt it never received.
+	armedFromRehydrate: boolean;
 	// Last column the card was observed in. Lets us:
 	//   1. Keep an armed entry alive when the agent reactivates and the
 	//      to_in_progress hook moves the card review → in_progress mid-commit.
@@ -553,81 +563,221 @@ export function createServerAutoReviewManager(
 		const meta = latestMetadataByTaskId.get(entry.taskId);
 		const changed = meta?.changedFiles ?? null;
 
+		// Orphan detection: when a card is trashed via CLI/UI while its
+		// auto-review entry is mid-oscillation, the worktree gets cleaned up
+		// but the entry can survive in `pendingByTaskId` (the trash command
+		// can race with hooks-api re-registering the task on the next Stop
+		// from the still-running executor PTY). Once the worktree is gone
+		// the entry will never make forward progress — changedFiles cannot
+		// be sampled and baseRef verification has no commit to point at —
+		// so it bounces review↔in_progress forever, blocking baseRef slots
+		// and confusing the UI. Detect "worktree gone" up front and unregister.
+		try {
+			const orphanPathInfo = await getTaskWorkspacePathInfo({
+				cwd: entry.workspacePath,
+				taskId: entry.taskId,
+				baseRef: entry.baseRef,
+			});
+			if (!orphanPathInfo.exists) {
+				logInfo(
+					`${logTag(entry.taskId, entry.baseRef)} worktree missing on disk — entry is orphaned, unregistering`,
+				);
+				clearTimer(entry);
+				clearVerificationRecheck(entry);
+				pendingByTaskId.delete(entry.taskId);
+				latestMetadataByTaskId.delete(entry.taskId);
+				releaseSlot(entry.baseRef, entry.taskId);
+				releaseMetadataSubscription(entry.workspaceId);
+				// Mark the (now stale) session as interrupted so the rest of
+				// the runtime stops resurrecting the in_progress column from
+				// hook events emitted by the long-dead PTY.
+				const terminalManager = deps.getTerminalManagerForWorkspace(entry.workspaceId);
+				const stale = terminalManager?.getSummary(entry.taskId);
+				if (stale && stale.state !== "interrupted") {
+					try {
+						terminalManager?.stopTaskSession(entry.taskId);
+					} catch {
+						// Best effort: state will reconcile on the next stop hook.
+					}
+				}
+				return;
+			}
+		} catch {
+			// Best effort: if path resolution fails, fall through to the
+			// normal evaluation flow rather than blocking auto-review.
+		}
+
+		// P2 — skip arming while the planner of a two-phase card is the active
+		// agent. The planner runs in plan mode and cannot stage or commit
+		// anything; if the planner's Stop hook armed auto-review, the commit
+		// prompt would hit a soon-to-exit PTY and either be lost or push a
+		// non-commit message into the planner's last turn. The executor will
+		// re-register the task once it spawns and emits its own Stop.
+		try {
+			const board = await loadWorkspaceBoardById(entry.workspaceId);
+			const card = board?.columns.flatMap((column) => column.cards).find((c) => c.id === entry.taskId);
+			if (card?.planAgentId) {
+				const terminalManagerForPhase = deps.getTerminalManagerForWorkspace(entry.workspaceId);
+				const currentAgentId = terminalManagerForPhase?.getSummary(entry.taskId)?.agentId ?? null;
+				if (currentAgentId === card.planAgentId) {
+					logInfo(
+						`${logTag(entry.taskId, entry.baseRef)} active agent is the planner (${currentAgentId}) — deferring auto-review until executor takes over`,
+					);
+					clearTimer(entry);
+					return;
+				}
+			}
+		} catch {
+			// Best effort: if the board lookup fails fall through to the
+			// normal evaluation flow. Worst case is the upstream behaviour.
+		}
+
+		// Honor the `.kanban-needs-input` sentinel. When the executor agent
+		// asks the user a question it cannot safely answer on its own, it
+		// writes this file to the worktree root before ending its turn.
+		// Auto-review must NOT inject its commit prompt while the file
+		// exists — that would override the question and ship a default
+		// decision. The agent removes the sentinel when the user responds.
+		try {
+			const pathInfo = await getTaskWorkspacePathInfo({
+				cwd: entry.workspacePath,
+				taskId: entry.taskId,
+				baseRef: entry.baseRef,
+			});
+			if (pathInfo.exists && existsSync(join(pathInfo.path, NEEDS_INPUT_FILE_NAME))) {
+				logInfo(
+					`${logTag(entry.taskId, entry.baseRef)} agent signaled ${NEEDS_INPUT_FILE_NAME} — skipping auto-review until user replies`,
+				);
+				clearTimer(entry);
+				return;
+			}
+			// Same gate for the background-task sentinel: the agent kicked
+			// off a `&`/`nohup` subprocess and reported its turn as "done"
+			// but the subprocess is still working. Don't arm or fire the
+			// commit prompt; wait for the agent to remove the sentinel and
+			// emit another Stop.
+			if (pathInfo.exists && existsSync(join(pathInfo.path, BG_ACTIVE_FILE_NAME))) {
+				logInfo(
+					`${logTag(entry.taskId, entry.baseRef)} agent signaled ${BG_ACTIVE_FILE_NAME} — background subprocess still active, skipping auto-review`,
+				);
+				clearTimer(entry);
+				return;
+			}
+		} catch {
+			// Best effort: if path resolution fails, fall through to the
+			// normal arming flow instead of blocking auto-review.
+		}
+
 		// `RuntimeTaskAutoReviewMode` is `"commit" | "pr"` in v0.1.67. The
 		// historical `"move_to_trash"` mode was removed upstream in commit
 		// b5e4b2e ("remove move_to_trash auto-review"). If they ever bring
 		// back a "skip-commit" trash mode, branch on it here.
 		if (entry.armed) {
 			if (changed === null || changed > 0) {
-				// Still working. Don't decide yet.
+				// Special case: rehydrated armed entries assume the original
+				// commit prompt is still in flight, but if the PTY was killed
+				// during the kanban restart the agent never received it.
+				// Detection: armedFromRehydrate is still set (we never sent
+				// a fresh prompt this lifetime) AND there are uncommitted
+				// changes (agent never acted on the supposed prompt). In
+				// that case demote to not-armed so the dispatch flow below
+				// re-sends the prompt to the live PTY.
+				if (entry.armedFromRehydrate && changed !== null && changed > 0) {
+					logInfo(
+						`${logTag(entry.taskId, entry.baseRef)} rehydrated as armed but worktree still has ${changed} uncommitted file(s) — the prompt likely went to a dead PTY; re-dispatching`,
+					);
+					entry.armed = false;
+					entry.armedAt = null;
+					entry.armedFromRehydrate = false;
+					// Fall through to the arming/dispatch flow below.
+				} else {
+					// Still working. Don't decide yet.
+					clearTimer(entry);
+					return;
+				}
+			} else {
+				// changedFiles === 0 → either commit succeeded and propagated, or
+				// the agent discarded the changes without committing onto baseRef.
+				// Verify by re-reading the baseRef tip.
+				const tipNow = await getBranchTip(entry.workspacePath, entry.baseRef);
+				if (entry.baseRefTipAtArm === null || tipNow === null) {
+					disarmWithoutTrash(
+						entry,
+						`could not verify baseRef advance (atArm=${entry.baseRefTipAtArm ?? "null"}, now=${tipNow ?? "null"})`,
+					);
+					return;
+				}
+				if (tipNow === entry.baseRefTipAtArm) {
+					// The local commit landed (changedFiles === 0) but the
+					// cherry-pick onto baseRef hasn't bumped the branch tip yet.
+					// Usually that means the agent is still mid-cherry-pick — they
+					// run `git commit` first and only after that `git -C P cherry-pick`,
+					// so this branch fires within seconds of `git commit`. Give it a
+					// grace window before concluding the work was lost.
+					const elapsedSinceArm = entry.armedAt === null ? Number.POSITIVE_INFINITY : Date.now() - entry.armedAt;
+					if (elapsedSinceArm < VERIFICATION_GRACE_PERIOD_MS) {
+						// Schedule a recheck unless one is already pending.
+						if (entry.verificationRecheckTimer === null) {
+							const remaining = Math.max(0, VERIFICATION_GRACE_PERIOD_MS - elapsedSinceArm);
+							const recheckDelay = Math.min(VERIFICATION_RECHECK_INTERVAL_MS, remaining);
+							logInfo(
+								`${logTag(entry.taskId, entry.baseRef)} baseRef still at ${entry.baseRefTipAtArm}; cherry-pick may be in flight, rechecking in ${recheckDelay}ms (grace=${Math.round(remaining / 1000)}s left)`,
+							);
+							const timer = setTimeout(() => {
+								entry.verificationRecheckTimer = null;
+								// Re-evaluate only if the entry is still the live one
+								// (the same defensive check we have in scheduleAction).
+								if (pendingByTaskId.get(entry.taskId) !== entry) {
+									return;
+								}
+								if (!entry.armed) {
+									return;
+								}
+								void evaluate(entry).catch((err) => {
+									logError(`${logTag(entry.taskId, entry.baseRef)} verification recheck failed:`, err);
+								});
+							}, recheckDelay);
+							timer.unref?.();
+							entry.verificationRecheckTimer = timer;
+						}
+						return;
+					}
+					disarmWithoutTrash(
+						entry,
+						`baseRef tip did not advance (${entry.baseRefTipAtArm}) within ${VERIFICATION_GRACE_PERIOD_MS / 1000}s. Commit was NOT propagated to ${entry.baseRef}.`,
+					);
+					return;
+				}
+				logInfo(
+					`${logTag(entry.taskId, entry.baseRef)} baseRef advanced ${entry.baseRefTipAtArm} → ${tipNow}, scheduling trash`,
+				);
+				scheduleAction(entry, "move_to_trash", () => {
+					void executeMoveToTrash(entry);
+				});
+				return;
+			}
+		}
+
+		// Not yet armed. Normal arming path requires uncommitted changes (the
+		// commit prompt asks the agent to stage + commit + cherry-pick).
+		// But there's a separate scenario where the worktree is "clean" yet
+		// the agent already made local commits without cherry-picking onto
+		// baseRef — typical when the executor follows the plan's "commit
+		// your work" instruction before the auto-review service fires its
+		// own prompt. Without this branch, those commits get stranded in
+		// the task worktree and the card sits stuck in review.
+		if (changed === null || changed <= 0) {
+			// Detect "agent committed locally, no cherry-pick yet" by counting
+			// commits reachable from worktree HEAD but not from baseRef.
+			const aheadCount = await countCommitsAheadOfBaseRef(entry.workspacePath, entry.baseRef);
+			if (aheadCount === null || aheadCount <= 0) {
 				clearTimer(entry);
 				return;
 			}
-			// changedFiles === 0 → either commit succeeded and propagated, or
-			// the agent discarded the changes without committing onto baseRef.
-			// Verify by re-reading the baseRef tip.
-			const tipNow = await getBranchTip(entry.workspacePath, entry.baseRef);
-			if (entry.baseRefTipAtArm === null || tipNow === null) {
-				disarmWithoutTrash(
-					entry,
-					`could not verify baseRef advance (atArm=${entry.baseRefTipAtArm ?? "null"}, now=${tipNow ?? "null"})`,
-				);
-				return;
-			}
-			if (tipNow === entry.baseRefTipAtArm) {
-				// The local commit landed (changedFiles === 0) but the
-				// cherry-pick onto baseRef hasn't bumped the branch tip yet.
-				// Usually that means the agent is still mid-cherry-pick — they
-				// run `git commit` first and only after that `git -C P cherry-pick`,
-				// so this branch fires within seconds of `git commit`. Give it a
-				// grace window before concluding the work was lost.
-				const elapsedSinceArm = entry.armedAt === null ? Number.POSITIVE_INFINITY : Date.now() - entry.armedAt;
-				if (elapsedSinceArm < VERIFICATION_GRACE_PERIOD_MS) {
-					// Schedule a recheck unless one is already pending.
-					if (entry.verificationRecheckTimer === null) {
-						const remaining = Math.max(0, VERIFICATION_GRACE_PERIOD_MS - elapsedSinceArm);
-						const recheckDelay = Math.min(VERIFICATION_RECHECK_INTERVAL_MS, remaining);
-						logInfo(
-							`${logTag(entry.taskId, entry.baseRef)} baseRef still at ${entry.baseRefTipAtArm}; cherry-pick may be in flight, rechecking in ${recheckDelay}ms (grace=${Math.round(remaining / 1000)}s left)`,
-						);
-						const timer = setTimeout(() => {
-							entry.verificationRecheckTimer = null;
-							// Re-evaluate only if the entry is still the live one
-							// (the same defensive check we have in scheduleAction).
-							if (pendingByTaskId.get(entry.taskId) !== entry) {
-								return;
-							}
-							if (!entry.armed) {
-								return;
-							}
-							void evaluate(entry).catch((err) => {
-								logError(`${logTag(entry.taskId, entry.baseRef)} verification recheck failed:`, err);
-							});
-						}, recheckDelay);
-						timer.unref?.();
-						entry.verificationRecheckTimer = timer;
-					}
-					return;
-				}
-				disarmWithoutTrash(
-					entry,
-					`baseRef tip did not advance (${entry.baseRefTipAtArm}) within ${VERIFICATION_GRACE_PERIOD_MS / 1000}s. Commit was NOT propagated to ${entry.baseRef}.`,
-				);
-				return;
-			}
 			logInfo(
-				`${logTag(entry.taskId, entry.baseRef)} baseRef advanced ${entry.baseRefTipAtArm} → ${tipNow}, scheduling trash`,
+				`${logTag(entry.taskId, entry.baseRef)} worktree has ${aheadCount} commit(s) ahead of ${entry.baseRef} but no uncommitted changes — arming so the commit prompt can drive the cherry-pick`,
 			);
-			scheduleAction(entry, "move_to_trash", () => {
-				void executeMoveToTrash(entry);
-			});
-			return;
-		}
-
-		// Not yet armed. Need changes to commit.
-		if (changed === null || changed <= 0) {
-			clearTimer(entry);
-			return;
+			// Fall through to the arming flow below.
 		}
 		// Don't arm unless the underlying agent session is actually idle and
 		// ready to receive input. Right after kanban restarts, auto-resume
@@ -688,6 +838,7 @@ export function createServerAutoReviewManager(
 			scheduledAction: null,
 			actionTimer: null,
 			moveToTrashInFlight: false,
+			armedFromRehydrate: rehydrate !== null,
 			currentColumnId: "review",
 			verificationRecheckTimer: null,
 		};

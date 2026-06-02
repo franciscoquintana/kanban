@@ -214,7 +214,7 @@ export function useGitActions({
 		return next;
 	}, [taskGitActionLoadingByTaskId]);
 
-	const shouldUseClineChatForTaskGitActions = isNativeClineAgentSelected(
+	const shouldUseClineChatForTaskGitActionsForWorkspaceDefault = isNativeClineAgentSelected(
 		runtimeProjectConfig?.selectedAgentId ?? null,
 	);
 
@@ -286,7 +286,16 @@ export function useGitActions({
 							}
 						: null,
 				});
-				if (shouldUseClineChatForTaskGitActions) {
+				// The Cline chat path only applies when the CARD's effective
+				// agent is cline. If the card overrides to openclaude (or any
+				// other terminal-based agent) we must route the commit prompt
+				// through sendTaskSessionInput (terminal PTY), not the Cline
+				// chat session that doesn't exist for this card.
+				const cardAgentId = selection.card.agentId ?? null;
+				const shouldUseClineChatForThisCard = cardAgentId
+					? isNativeClineAgentSelected(cardAgentId)
+					: shouldUseClineChatForTaskGitActionsForWorkspaceDefault;
+				if (shouldUseClineChatForThisCard) {
 					const sent = await sendTaskChatMessage(taskId, prompt, { mode: "act" });
 					if (!sent.ok) {
 						showAppToast({
@@ -334,7 +343,7 @@ export function useGitActions({
 			sendTaskChatMessage,
 			sendTaskSessionInput,
 			setTaskGitActionLoading,
-			shouldUseClineChatForTaskGitActions,
+			shouldUseClineChatForTaskGitActionsForWorkspaceDefault,
 			taskGitActionLoadingByTaskId,
 		],
 	);

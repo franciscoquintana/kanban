@@ -75,6 +75,8 @@ import type {
 	RuntimeTaskChatReloadResponse,
 	RuntimeTaskChatSendRequest,
 	RuntimeTaskChatSendResponse,
+	RuntimeTaskPlanFileRequest,
+	RuntimeTaskPlanFileResponse,
 	RuntimeTaskSessionInputRequest,
 	RuntimeTaskSessionInputResponse,
 	RuntimeTaskSessionStartRequest,
@@ -166,6 +168,8 @@ import {
 	runtimeTaskChatReloadResponseSchema,
 	runtimeTaskChatSendRequestSchema,
 	runtimeTaskChatSendResponseSchema,
+	runtimeTaskPlanFileRequestSchema,
+	runtimeTaskPlanFileResponseSchema,
 	runtimeTaskSessionInputRequestSchema,
 	runtimeTaskSessionInputResponseSchema,
 	runtimeTaskSessionStartRequestSchema,
@@ -230,6 +234,10 @@ export interface RuntimeTrpcContext {
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskChatMessagesRequest,
 		) => Promise<RuntimeTaskChatMessagesResponse>;
+		getTaskPlanFile: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskPlanFileRequest,
+		) => Promise<RuntimeTaskPlanFileResponse>;
 		getClineSlashCommands: (scope: RuntimeTrpcWorkspaceScope | null) => Promise<RuntimeSlashCommandsResponse>;
 		sendTaskChatMessage: (
 			scope: RuntimeTrpcWorkspaceScope,
@@ -478,6 +486,12 @@ export const runtimeAppRouter = t.router({
 			.output(runtimeTaskChatMessagesResponseSchema)
 			.query(async ({ ctx, input }) => {
 				return await ctx.runtimeApi.getTaskChatMessages(ctx.workspaceScope, input);
+			}),
+		getTaskPlanFile: workspaceProcedure
+			.input(runtimeTaskPlanFileRequestSchema)
+			.output(runtimeTaskPlanFileResponseSchema)
+			.query(async ({ ctx, input }) => {
+				return await ctx.runtimeApi.getTaskPlanFile(ctx.workspaceScope, input);
 			}),
 		getClineSlashCommands: t.procedure.output(runtimeSlashCommandsResponseSchema).query(async ({ ctx }) => {
 			return await ctx.runtimeApi.getClineSlashCommands(ctx.workspaceScope);

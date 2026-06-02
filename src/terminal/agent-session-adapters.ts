@@ -731,6 +731,128 @@ function shouldInspectCodexOutputForTransition(summary: RuntimeTaskSessionSummar
 	);
 }
 
+// Openclaude is a Claude Code fork that, unlike claude itself, does NOT
+// accept a positional prompt arg when launched in interactive REPL mode (the
+// arg is silently ignored). The previous attempt used `-p` (print mode) so
+// openclaude would consume the positional and run to completion — but `-p`
+// also suppresses streaming output, so kanban's PTY only ever shows the
+// final summary line, hiding the agent's work from the user.
+//
+// This adapter mirrors codex's pattern: spawn openclaude in interactive
+// REPL, wait for the "Ready - type /help to begin" splash to render, then
+// paste the prompt via a bracketed-paste sequence. The REPL renders every
+// tool call, thinking step, and file edit live in the PTY — same UX as
+// claude itself.
+function openclaudePromptDetector(data: string): SessionTransitionEvent | null {
+	const stripped = stripAnsi(data);
+	// openclaude REPL prints this line once the splash + provider info are
+	// rendered and the input prompt is alive. Detecting it ensures we paste
+	// the prompt AFTER the REPL is ready to receive keystrokes.
+	if (/Ready\s*[-–—]\s*type\s+\/help/i.test(stripped)) {
+		return { type: "agent.prompt-ready" };
+	}
+	return null;
+}
+
+const openclaudeAdapter: AgentSessionAdapter = {
+	async prepare(input) {
+		const args = [...input.args];
+		const env: Record<string, string | undefined> = {
+			FORCE_HYPERLINK: "1",
+		};
+
+		if (input.autonomousModeEnabled && !hasCliOption(args, "--dangerously-skip-permissions")) {
+			args.push("--dangerously-skip-permissions");
+		}
+
+		// Wire kanban hooks (Stop → to_review, PreToolUse → activity, etc.)
+		// via a generated settings.json passed with `--settings`. openclaude
+		// honours the same hook contract as Claude Code but its default
+		// settings dir is NOT ~/.cline/kanban/hooks/claude/, so without
+		// this flag the Stop hook never fires and cards stay stuck
+		// in_progress after the agent completes.
+		const hooks = resolveHookContext(input);
+		if (hooks) {
+			const settingsPath = join(getHookAgentDirectory("openclaude"), "settings.json");
+			const hooksSettings = {
+				hooks: {
+					Stop: [
+						{ hooks: [{ type: "command", command: buildHookCommand("to_review", { source: "openclaude" }) }] },
+					],
+					SubagentStop: [
+						{ hooks: [{ type: "command", command: buildHookCommand("activity", { source: "openclaude" }) }] },
+					],
+					// PreToolUse fires BEFORE the tool runs — "about to do work".
+					// to_in_progress is idempotent (no-op if already running, per
+					// canTransitionTaskForHookEvent in hooks-api.ts), so this
+					// will only move the card review → in_progress when the
+					// agent legitimately starts a new turn (e.g. auto-review
+					// commit prompt, or openclaude itself continuing after an
+					// approval). For the auto-memory pattern (one PreToolUse +
+					// PostToolUse after a Stop) the card briefly bounces
+					// in_progress → review when the next Stop fires, which is
+					// the correct terminal state. Using PostToolUse here would
+					// leave the card stuck in_progress because no Stop follows
+					// the post-turn auto-memory call.
+					PreToolUse: [
+						{
+							matcher: "*",
+							hooks: [
+								{ type: "command", command: buildHookCommand("to_in_progress", { source: "openclaude" }) },
+							],
+						},
+					],
+					// PostToolUse stays as activity: the work is done by this
+					// point, and any column transition is the next Stop's job.
+					PostToolUse: [
+						{
+							matcher: "*",
+							hooks: [{ type: "command", command: buildHookCommand("activity", { source: "openclaude" }) }],
+						},
+					],
+					UserPromptSubmit: [
+						{
+							hooks: [
+								{ type: "command", command: buildHookCommand("to_in_progress", { source: "openclaude" }) },
+							],
+						},
+					],
+					Notification: [
+						{
+							matcher: "*",
+							hooks: [{ type: "command", command: buildHookCommand("activity", { source: "openclaude" }) }],
+						},
+					],
+				},
+			};
+			await ensureTextFile(settingsPath, JSON.stringify(hooksSettings, null, 2));
+			args.push("--settings", settingsPath);
+			Object.assign(
+				env,
+				createHookRuntimeEnv({
+					taskId: hooks.taskId,
+					workspaceId: hooks.workspaceId,
+				}),
+			);
+		}
+
+		const trimmed = input.prompt.trim();
+		// openclaude REPL does NOT honour bracketed-paste sequences. Send
+		// raw text only; the session-manager fires a separate ENTER
+		// (\r) ~800ms later so the REPL has time to apply the input
+		// buffer before the submit keystroke arrives.
+		const deferredStartupInput = trimmed || undefined;
+
+		return {
+			binary: input.binary,
+			args,
+			env,
+			deferredStartupInput,
+			detectOutputTransition: openclaudePromptDetector,
+		};
+	},
+};
+
 const codexAdapter: AgentSessionAdapter = {
 	async prepare(input) {
 		const codexArgs = [...input.args];
@@ -1432,11 +1554,10 @@ const ADAPTERS: Record<RuntimeAgentId, AgentSessionAdapter> = {
 	codex: codexAdapter,
 	gemini: geminiAdapter,
 	opencode: opencodeAdapter,
-	// openclaude is a fork of Claude Code, so it accepts the same CLI flags
-	// (--dangerously-skip-permissions, --continue, --permission-mode plan, etc.).
-	// Reuse the Claude adapter; auto-review hooks via ~/.claude/settings.json
-	// will not apply (openclaude has its own settings dir) but core launch works.
-	openclaude: claudeAdapter,
+	// Custom adapter: openclaude runs as interactive REPL. The adapter
+	// pastes the prompt via deferredStartupInput and the session-manager
+	// then sends a separate ENTER after the input has settled.
+	openclaude: openclaudeAdapter,
 	droid: droidAdapter,
 	kiro: kiroAdapter,
 	cline: clineAdapter,

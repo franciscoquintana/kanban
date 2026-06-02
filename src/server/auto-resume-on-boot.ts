@@ -10,9 +10,10 @@
 // not already running, with `resume: true` (so claude resumes via
 // `--continue`) and `prompt: ""` (so the user decides what to type next).
 //
-// Scope: only `claude` is supported in this commit. Tasks running on other
-// agents (codex, droid, kiro, gemini, opencode) are left alone — the user
-// will have to click Play manually for those, like upstream behaviour.
+// Scope: `claude` and `openclaude` (Claude Code fork, same flags). Tasks
+// running on other agents (codex, droid, kiro, gemini, opencode) are left
+// alone — the user will have to click Play manually for those, like upstream
+// behaviour.
 // Cline native is also skipped because the ClineTaskSessionService manages
 // its own resume flow and we don't want to step on it.
 //
@@ -20,6 +21,10 @@
 //
 // See `.plan/docs/fork-server-side-auto-review.md`.
 
+import { existsSync, readdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import type { RuntimeAgentId } from "../core/api-contract.js";
 import {
 	listWorkspaceIndexEntries,
 	loadWorkspaceBoardById,
@@ -29,10 +34,39 @@ import { resolveAgentCommand } from "../terminal/agent-registry.js";
 import type { TerminalSessionManager } from "../terminal/session-manager.js";
 import { getTaskWorkspacePathInfo } from "../workspace/task-worktree.js";
 import { logError, logInfo } from "./server-log.js";
+import { resolveTwoPhasePlan } from "./two-phase.js";
 import type { WorkspaceRegistry } from "./workspace-registry.js";
 
+/**
+ * Detect whether claude/openclaude has stored chat history for the given
+ * worktree cwd. Both binaries persist session jsonl at
+ * `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`, where the encoded
+ * cwd is the absolute path with `/` and `.` both replaced by `-`. If any
+ * `.jsonl` exists in that directory, `--continue` will resume the most
+ * recent session on next spawn.
+ *
+ * This lets auto-resume pick `--continue` even when sessions.json on disk
+ * is stale (e.g. fresh card whose first spawn never had time to persist its
+ * session record). Without this, the resumed PTY restarts from scratch and
+ * the agent rebuilds chat context from the plan file — slower and a wasted
+ * round-trip to the LLM.
+ */
+function hasAgentChatHistoryForWorktree(worktreePath: string): boolean {
+	const encoded = worktreePath.replaceAll("/", "-").replaceAll(".", "-");
+	const dir = join(homedir(), ".claude", "projects", encoded);
+	try {
+		if (!existsSync(dir)) return false;
+		return readdirSync(dir).some((f) => f.endsWith(".jsonl"));
+	} catch {
+		return false;
+	}
+}
+
 const STAGGER_BETWEEN_SPAWNS_MS = 500;
-const SUPPORTED_AGENT_ID = "claude" as const;
+// Agents that support headless auto-resume on kanban boot. claude works via
+// `--continue`. openclaude is a Claude Code fork sharing the same flags, so
+// it auto-resumes the same way.
+const SUPPORTED_AGENT_IDS = new Set<RuntimeAgentId>(["claude", "openclaude"]);
 
 function isOptOutSet(): boolean {
 	const raw = process.env.KANBAN_DISABLE_AUTO_RESUME?.trim().toLowerCase();
@@ -142,13 +176,66 @@ async function resumeWorkspace(input: ResumeWorkspaceInput): Promise<void> {
 		}
 		const summary = sessions[card.id];
 		const hasHistory = summary !== undefined;
-		// Order: per-task override (card.agentId) > previous run (summary.agentId) > workspace default.
-		const effectiveAgentId = card.agentId ?? summary?.agentId ?? runtimeConfig.selectedAgentId;
-		if (effectiveAgentId !== SUPPORTED_AGENT_ID) {
+
+		// Resolve worktree path early so two-phase can probe for .kanban-plan.md.
+		const pathInfo = await getTaskWorkspacePathInfo({
+			cwd: input.workspacePath,
+			taskId: card.id,
+			baseRef: card.baseRef,
+		});
+
+		// If the card declares planAgentId, resolveTwoPhasePlan picks plan vs
+		// exec phase based on whether the plan file already exists.
+		const twoPhase = pathInfo.exists ? resolveTwoPhasePlan(card, pathInfo.path) : null;
+
+		// Order: two-phase resolution > per-task override > previous run > workspace default.
+		const effectiveAgentId = twoPhase?.agentId ?? card.agentId ?? summary?.agentId ?? runtimeConfig.selectedAgentId;
+		if (!effectiveAgentId || !SUPPORTED_AGENT_IDS.has(effectiveAgentId)) {
 			logInfo(
-				`[auto-resume] task ${card.id} skipped (agent=${effectiveAgentId}, only ${SUPPORTED_AGENT_ID} supported)`,
+				`[auto-resume] task ${card.id} skipped (agent=${effectiveAgentId}, supported=${[...SUPPORTED_AGENT_IDS].join(",")})`,
 			);
 			continue;
+		}
+
+		// Two-phase resume policy: start fresh ONLY when the resolved phase
+		// agent differs from the last-recorded session agent — i.e. a real
+		// plan→exec handoff that must not inherit the planner's chat.
+		// When the resolved agent matches the previous one (e.g. exec phase
+		// being restarted after a kanban crash mid-turn), resume normally so
+		// openclaude --continue picks up its own prior chat history instead
+		// of replaying the plan prompt from scratch.
+		const isTwoPhaseAgentSwitch = twoPhase !== null && hasHistory && summary?.agentId !== effectiveAgentId;
+		const isTwoPhaseInitialSpawn = twoPhase !== null && !hasHistory;
+		// Override the "fresh start" decision when the agent already has
+		// chat history persisted in `~/.claude/projects/<encoded-cwd>/`. This
+		// fires when sessions.json is stale (fresh card whose first PTY died
+		// before writing the session record) — without this override the
+		// next spawn would discard the agent's mid-turn context and resend
+		// the full plan prompt, wasting tokens and risking duplicate work.
+		// Restricted to exec-phase recovery so a true plan→exec handoff
+		// (which legitimately wants a fresh openclaude session) is not
+		// affected: the planner's chat history under the worktree path is
+		// claude's, not openclaude's, and we don't want to feed it back in.
+		const onDiskHistory =
+			pathInfo.exists && (twoPhase === null || twoPhase.phase === "exec")
+				? hasAgentChatHistoryForWorktree(pathInfo.path)
+				: false;
+		const recoverFromDiskHistory = isTwoPhaseInitialSpawn && onDiskHistory;
+		if (recoverFromDiskHistory) {
+			logInfo(
+				`[auto-resume] task ${card.id} sessions.json stale but agent history exists on disk — resuming with --continue`,
+			);
+		}
+		const resume = recoverFromDiskHistory
+			? true
+			: isTwoPhaseAgentSwitch || isTwoPhaseInitialSpawn
+				? false
+				: hasHistory;
+		const promptToUse = resume ? "" : twoPhase ? twoPhase.prompt : card.prompt;
+		const startInPlanModeToUse = twoPhase ? twoPhase.startInPlanMode : card.startInPlanMode;
+
+		if (twoPhase) {
+			logInfo(`[auto-resume] task ${card.id} two-phase: phase=${twoPhase.phase} agent=${effectiveAgentId}`);
 		}
 
 		try {
@@ -158,12 +245,13 @@ async function resumeWorkspace(input: ResumeWorkspaceInput): Promise<void> {
 				terminalManager: input.terminalManager,
 				runtimeConfig,
 				taskId: card.id,
+				agentId: effectiveAgentId,
 				baseRef: card.baseRef,
-				startInPlanMode: card.startInPlanMode,
+				startInPlanMode: startInPlanModeToUse,
 				// With history → resume mode (claude --continue, empty prompt).
 				// Without history → fresh start with the task's original prompt.
-				resume: hasHistory,
-				prompt: hasHistory ? "" : card.prompt,
+				resume,
+				prompt: promptToUse,
 			});
 		} catch (err) {
 			logError(`[auto-resume] task ${card.id} failed to spawn`, err);
@@ -181,6 +269,7 @@ interface SpawnOneInput {
 	terminalManager: TerminalSessionManager;
 	runtimeConfig: Parameters<typeof resolveAgentCommand>[0];
 	taskId: string;
+	agentId: RuntimeAgentId;
 	baseRef: string;
 	startInPlanMode?: boolean;
 	// When true, claude is launched with `--continue` and an empty kickoff
@@ -200,17 +289,16 @@ async function spawnOne(input: SpawnOneInput): Promise<void> {
 		logInfo(`[auto-resume] task ${input.taskId} skipped (worktree missing at ${pathInfo.path})`);
 		return;
 	}
-	// Force the resolved config to use claude regardless of the current
-	// runtime selection (we already filtered above, but in_progress tasks
-	// might have been started with a per-card override that no longer
-	// matches the workspace default).
+	// Pin the resolved config to the per-card agent (already filtered above
+	// to one of the supported agents); if the workspace default differs we
+	// must not silently switch to it.
 	const resolvedConfig =
-		input.runtimeConfig.selectedAgentId === SUPPORTED_AGENT_ID
+		input.runtimeConfig.selectedAgentId === input.agentId
 			? input.runtimeConfig
-			: { ...input.runtimeConfig, selectedAgentId: SUPPORTED_AGENT_ID };
+			: { ...input.runtimeConfig, selectedAgentId: input.agentId };
 	const resolved = resolveAgentCommand(resolvedConfig, { resume: input.resume });
 	if (!resolved) {
-		logInfo(`[auto-resume] task ${input.taskId} skipped (no runnable claude binary on PATH)`);
+		logInfo(`[auto-resume] task ${input.taskId} skipped (no runnable ${input.agentId} binary on PATH)`);
 		return;
 	}
 	await input.terminalManager.startTaskSession({

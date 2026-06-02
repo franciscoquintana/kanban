@@ -58,11 +58,15 @@ export const RUNTIME_AGENT_CATALOG: RuntimeAgentCatalogEntry[] = [
 	},
 	{
 		id: "openclaude",
-		label: "OpenClaude (qwen via local proxy)",
+		label: "OpenClaude (free model via local proxy)",
 		binary: "openclaude-qwen",
+		// Interactive REPL — openclaudeAdapter pastes the prompt + Enter
+		// once the splash renders, mimicking a user typing into the UI.
+		// The wrapper picks which free opencode.ai/zen model to use
+		// (deepseek-v4-flash-free by default; qwen3.6-plus-free was the
+		// original target but went paid-only in 2026-05).
 		baseArgs: [],
 		autonomousArgs: ["--dangerously-skip-permissions"],
-		resumeArgs: ["--continue"],
 		installUrl: "https://github.com/Gitlawb/openclaude",
 	},
 	{

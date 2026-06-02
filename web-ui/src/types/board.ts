@@ -45,6 +45,11 @@ export interface BoardCard {
 	autoReviewMode?: TaskAutoReviewMode;
 	images?: TaskImage[];
 	agentId?: RuntimeAgentId;
+	// Optional planner agent for two-phase delegation. When set, the card
+	// runs `planAgentId` first (in plan mode, writing `.kanban-plan.md` to
+	// the worktree) and then automatically hands off to `agentId` with the
+	// plan content as the prompt. See `src/server/two-phase.ts`.
+	planAgentId?: RuntimeAgentId;
 	clineSettings?: RuntimeTaskClineSettings;
 	baseRef: string;
 	createdAt: number;

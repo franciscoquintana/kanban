@@ -202,9 +202,25 @@ function hasCodexStartupUiRendered(text: string): boolean {
 	return stripped.includes("openai codex (v");
 }
 
+export interface TerminalSessionManagerOptions {
+	/**
+	 * Fired right after a PTY exits (after the session has been marked
+	 * terminated and summary emitted). Used by workspace-registry to wire
+	 * the two-phase delegation auto-handoff: when a planner agent exits
+	 * and `.kanban-plan.md` exists, kanban respawns the card with the
+	 * executor agent automatically.
+	 */
+	onSessionExited?: (taskId: string, summary: RuntimeTaskSessionSummary) => void;
+}
+
 export class TerminalSessionManager implements TerminalSessionService {
 	private readonly entries = new Map<string, SessionEntry>();
 	private readonly summaryListeners = new Set<(summary: RuntimeTaskSessionSummary) => void>();
+	private readonly onSessionExited?: (taskId: string, summary: RuntimeTaskSessionSummary) => void;
+
+	constructor(options: TerminalSessionManagerOptions = {}) {
+		this.onSessionExited = options.onSessionExited;
+	}
 
 	private trySendDeferredCodexStartupInput(taskId: string): boolean {
 		const entry = this.entries.get(taskId);
@@ -223,6 +239,28 @@ export class TerminalSessionManager implements TerminalSessionService {
 		const deferredInput = active.deferredStartupInput;
 		active.deferredStartupInput = null;
 		active.session.write(deferredInput);
+		return true;
+	}
+
+	// Generic dispatcher for agents whose adapter exposes `deferredStartupInput`
+	// and signals readiness via `detectOutputTransition` returning
+	// `agent.prompt-ready`. Used by openclaude (REPL paste pattern).
+	//
+	// openclaude's Ink/React TUI input handler swallows trailing \r in the
+	// same write as the text. Send the text first, then write a separate
+	// ENTER after the REPL has had a chance to flush the buffer.
+	private trySendDeferredAdapterStartupInput(taskId: string): boolean {
+		const entry = this.entries.get(taskId);
+		const active = entry?.active;
+		if (!entry || !active) return false;
+		if (active.deferredStartupInput === null) return false;
+		const deferredInput = active.deferredStartupInput;
+		active.deferredStartupInput = null;
+		active.session.write(deferredInput);
+		setTimeout(() => {
+			const stillActive = this.entries.get(taskId)?.active;
+			if (stillActive) stillActive.session.write("\r");
+		}, 800);
 		return true;
 	}
 
@@ -438,6 +476,15 @@ export class TerminalSessionManager implements TerminalSessionService {
 							}
 							this.emitSummary(summary);
 						}
+						// Generic deferred-startup-input dispatch for adapters
+						// other than codex (which has its own dispatch above).
+						if (
+							adapterEvent.type === "agent.prompt-ready" &&
+							entry.summary.agentId !== "codex" &&
+							entry.active.deferredStartupInput !== null
+						) {
+							this.trySendDeferredAdapterStartupInput(request.taskId);
+						}
 					}
 
 					for (const taskListener of entry.listeners.values()) {
@@ -470,6 +517,17 @@ export class TerminalSessionManager implements TerminalSessionService {
 					this.emitSummary(summary);
 					if (shouldAutoRestart) {
 						this.scheduleAutoRestart(currentEntry);
+					}
+					// Fire the post-exit hook for two-phase delegation handoff,
+					// even when the Stop hook didn't reach kanban (claude exits
+					// fast after ExitPlanMode and the to_review event races the
+					// PTY teardown).
+					if (this.onSessionExited) {
+						try {
+							this.onSessionExited(request.taskId, cloneSummary(summary));
+						} catch {
+							// Best effort: handoff failure should not block exit.
+						}
 					}
 
 					const cleanupFn = currentActive.onSessionCleanup;
