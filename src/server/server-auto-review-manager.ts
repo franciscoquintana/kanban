@@ -1043,6 +1043,23 @@ export function createServerAutoReviewManager(
 			await new Promise<void>((resolve) => setTimeout(resolve, MOVE_ANIMATION_GRACE_MS));
 
 			const result = await mutateWorkspaceState<{ moved: boolean }>(workspacePath, (latestState) => {
+				// Trash is terminal: never resurrect a card from trash via the
+				// runtime-state-hub column-sync (which calls
+				// `moveTaskInProgressToReview` on every PTY exit, including
+				// the legitimate stopTaskSession kanban itself issues right
+				// after auto-review moves the card to trash). Without this
+				// guard, the trashed card gets pulled back to review by the
+				// post-trash PTY-exit listener and the next auto-review tick
+				// re-registers it — visible bug from 9992f REFACTOR01:
+				// auto-review logged `moved to trash` and was immediately
+				// followed by `registered for auto-review` for the same task.
+				if (targetColumnId !== "trash") {
+					for (const column of latestState.board.columns) {
+						if (column.id === "trash" && column.cards.some((card) => card.id === taskId)) {
+							return { board: latestState.board, value: { moved: false }, save: false };
+						}
+					}
+				}
 				const moved = moveTaskToColumn(latestState.board, taskId, targetColumnId, Date.now());
 				if (!moved.moved) {
 					return { board: latestState.board, value: { moved: false }, save: false };
