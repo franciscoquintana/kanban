@@ -200,7 +200,7 @@ Command:
 
 Parameters:
 - \`--title "<text>"\` optional task title. If omitted, Kanban derives one from the prompt.
-- \`--prompt "<text>"\` required task prompt text.
+- \`--prompt "<text>"\` required task prompt text. **Do NOT embed the absolute workspace path** in the prompt (e.g. avoid lines like \`Project: /home/user/projects/foo\`). The agent that runs the card lives in a worktree (\`.cline/worktrees/<task-id>/<workspace>\`), not at the workspace root; if it sees an absolute base path it will write outputs there instead of in its own worktree — breaking two-phase handoff (the planner writes \`.kanban-plan.md\` to the wrong directory and the executor never picks it up) and polluting the base workspace with stray files. Refer to the project by name only (e.g. \`Project: backend\`), or describe the branch and let the worktree path stay implicit.
 - \`--project-path <path>\` optional workspace path. If not already registered in Kanban, it is auto-added for git repos.
 - \`--base-ref <branch>\` optional base branch/worktree ref. Defaults to current branch, then default branch, then first known branch.
 - \`--start-in-plan-mode <true|false>\` optional. Default false. Set true only when explicitly requested.
