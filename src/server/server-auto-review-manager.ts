@@ -78,6 +78,18 @@ const MOVE_ANIMATION_GRACE_MS = 80;
 const VERIFICATION_GRACE_PERIOD_MS = 3_600_000;
 // Backoff between re-checks of baseRef tip during the grace period.
 const VERIFICATION_RECHECK_INTERVAL_MS = 5_000;
+// Window after `registerTaskForAutoReview` during which an unarmed
+// entry is NOT dropped when the card leaves the review column. The
+// auto-memory subagent that openclaude (and similar derivatives) runs
+// post-Stop fires PreToolUse / PostToolUse in the same millisecond
+// the card lands in review — without this grace the entry is
+// unregistered before `evaluate` can run, so the commit prompt never
+// dispatches and cards that the executor self-committed never reach
+// trash. The grace is enforced even after `unregisterTask` is logged
+// downstream — the entry stays in `pendingByTaskId` and the next
+// metadata tick (or the next time the card re-enters review)
+// re-runs `evaluate` against it.
+const UNARMED_DROP_GRACE_MS = 15_000;
 
 interface PendingEntry {
 	workspaceId: string;
@@ -98,6 +110,14 @@ interface PendingEntry {
 	// changedFiles>0 we must re-dispatch instead of waiting forever for the
 	// agent to act on a prompt it never received.
 	armedFromRehydrate: boolean;
+	// Wall-clock when this entry was created. Used by
+	// `onWorkspaceStateUpdated` to grant a grace window before dropping
+	// an unarmed entry that the card has just moved out of review,
+	// because the agent's post-Stop tool activity (openclaude
+	// auto-memory subagent in particular) can flip the card review →
+	// in_progress in the same millisecond that the auto-review entry is
+	// being registered, leaving evaluate without a chance to arm.
+	registeredAt: number;
 	// Last column the card was observed in. Lets us:
 	//   1. Keep an armed entry alive when the agent reactivates and the
 	//      to_in_progress hook moves the card review → in_progress mid-commit.
@@ -839,6 +859,7 @@ export function createServerAutoReviewManager(
 			actionTimer: null,
 			moveToTrashInFlight: false,
 			armedFromRehydrate: rehydrate !== null,
+			registeredAt: Date.now(),
 			currentColumnId: "review",
 			verificationRecheckTimer: null,
 		};
@@ -952,6 +973,19 @@ export function createServerAutoReviewManager(
 				// or otherwise moved while the cherry-pick is in flight. Keep
 				// the entry — verification or the grace timeout will retire
 				// it cleanly and release the baseRef slot at that point.
+				continue;
+			}
+			const sinceRegistered = Date.now() - entry.registeredAt;
+			if (sinceRegistered < UNARMED_DROP_GRACE_MS) {
+				if (inProgressCardsById.has(taskId)) {
+					entry.currentColumnId = "in_progress";
+				}
+				// Inside the grace window. Keep the entry so the next
+				// metadata tick or board update can give `evaluate` a
+				// chance to arm — the agent may already have committed
+				// and cherry-picked, in which case verification will
+				// fire on the very next poll. Drop only after the
+				// window elapses if the entry is still unarmed.
 				continue;
 			}
 			clearTimer(entry);

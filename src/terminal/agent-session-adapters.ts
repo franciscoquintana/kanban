@@ -782,28 +782,33 @@ const openclaudeAdapter: AgentSessionAdapter = {
 					SubagentStop: [
 						{ hooks: [{ type: "command", command: buildHookCommand("activity", { source: "openclaude" }) }] },
 					],
-					// PreToolUse fires BEFORE the tool runs — "about to do work".
-					// to_in_progress is idempotent (no-op if already running, per
-					// canTransitionTaskForHookEvent in hooks-api.ts), so this
-					// will only move the card review → in_progress when the
-					// agent legitimately starts a new turn (e.g. auto-review
-					// commit prompt, or openclaude itself continuing after an
-					// approval). For the auto-memory pattern (one PreToolUse +
-					// PostToolUse after a Stop) the card briefly bounces
-					// in_progress → review when the next Stop fires, which is
-					// the correct terminal state. Using PostToolUse here would
-					// leave the card stuck in_progress because no Stop follows
-					// the post-turn auto-memory call.
+					// PreToolUse → activity (no column flip). Originally mapped
+					// to to_in_progress, which broke the auto-review pipeline:
+					// after a Stop, openclaude fires an auto-memory subagent
+					// that runs an Edit (PreToolUse + PostToolUse + SubagentStop)
+					// inside the same PTY. With PreToolUse → to_in_progress,
+					// the subagent's tool call yanked the card review →
+					// in_progress in the gap between auto-review registering
+					// and arming. The auto-review manager then saw "no longer
+					// in review" and unregistered the entry before it could
+					// dispatch the commit prompt — so cards committed by the
+					// agent itself (`ecb4de6` style) cherry-picked to baseRef
+					// but never made it to trash. Aligning with the claude
+					// adapter (claude has used PreToolUse → activity from day
+					// one and is the agent that "just works") fixes this:
+					// UserPromptSubmit is the only event that flips review →
+					// in_progress, which fires both for real user input
+					// (Continue typed in the UI) and for kanban's own
+					// `writeInput` of the auto-review commit prompt.
 					PreToolUse: [
 						{
 							matcher: "*",
-							hooks: [
-								{ type: "command", command: buildHookCommand("to_in_progress", { source: "openclaude" }) },
-							],
+							hooks: [{ type: "command", command: buildHookCommand("activity", { source: "openclaude" }) }],
 						},
 					],
-					// PostToolUse stays as activity: the work is done by this
-					// point, and any column transition is the next Stop's job.
+					// PostToolUse stays as activity for the same reason:
+					// flipping back here would re-introduce the oscillation
+					// via the auto-memory subagent's tool completion.
 					PostToolUse: [
 						{
 							matcher: "*",
