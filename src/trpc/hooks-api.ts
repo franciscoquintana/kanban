@@ -88,6 +88,38 @@ export function createHooksApi(deps: CreateHooksApiDependencies): RuntimeTrpcCon
 					if (body.metadata) {
 						manager.applyHookActivity(taskId, body.metadata);
 					}
+					// Column-sync safety net: an in-memory state mismatch (e.g. a
+					// previous `to_review` already moved the summary to
+					// `awaiting_review` and a `to_in_progress` never flipped it
+					// back, or the adapter is mid-race) causes the state-machine
+					// to silently no-op. Without this, the persisted column drifts
+					// out of sync with what the agent reported: the agent thinks
+					// "Stop succeeded", the runtime returned ok:true, but the card
+					// never visibly moves to review and the user loses the auto-
+					// review prompt entirely. The persisted column is the source
+					// of truth for the UI, so we sync it explicitly here when the
+					// physical column disagrees with the requested transition.
+					try {
+						const board = await loadWorkspaceBoardById(workspaceId);
+						let physicalColumn: string | null = null;
+						for (const column of board?.columns ?? []) {
+							if (column.cards.some((c) => c.id === taskId)) {
+								physicalColumn = column.id;
+								break;
+							}
+						}
+						if (event === "to_review" && physicalColumn === "in_progress" && deps.moveTaskInProgressToReview) {
+							void deps.moveTaskInProgressToReview(workspaceId, workspacePath, taskId).catch(() => {});
+						} else if (
+							event === "to_in_progress" &&
+							physicalColumn === "review" &&
+							deps.moveTaskReviewToInProgress
+						) {
+							void deps.moveTaskReviewToInProgress(workspaceId, workspacePath, taskId).catch(() => {});
+						}
+					} catch {
+						// Best effort; do not block the hook return on board lookup failures.
+					}
 					return {
 						ok: true,
 					} satisfies RuntimeHookIngestResponse;
