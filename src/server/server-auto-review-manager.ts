@@ -958,6 +958,25 @@ export function createServerAutoReviewManager(
 		//     cherry-pick — which is exactly what `baseRef` serialization
 		//     exists to prevent.
 		//   - otherwise (unarmed, card left the active columns) → drop.
+		// Build a lookup of cards currently in the trash column for the
+		// armed-entry guard below: trash is terminal, and an armed entry
+		// pointing at a trashed card should release its baseRef slot
+		// immediately so the queued siblings can fire their commit prompts.
+		// Without this, a card that was armed → trashed (by auto-review's own
+		// move-to-trash, or by `kanban task trash`, or by the user) keeps the
+		// `inFlightByBaseRef` slot pinned forever, queueing every subsequent
+		// task on the same baseRef behind a zombie. This is especially
+		// visible after a kanban restart: the persisted `autoReviewArmState`
+		// on a trashed card rehydrates the entry as armed even though the
+		// worktree is long gone.
+		const trashCardIds = new Set<string>();
+		for (const column of board.columns) {
+			if (column.id === "trash") {
+				for (const card of column.cards) {
+					trashCardIds.add(card.id);
+				}
+			}
+		}
 		for (const [taskId, entry] of pendingByTaskId) {
 			if (entry.workspaceId !== workspaceId) {
 				continue;
@@ -968,11 +987,30 @@ export function createServerAutoReviewManager(
 			if (entry.armed) {
 				if (inProgressCardsById.has(taskId)) {
 					entry.currentColumnId = "in_progress";
+					// Card may have been dragged out by the user or moved by
+					// hook-driven column-sync while the cherry-pick is in
+					// flight. Keep the entry — verification or the grace
+					// timeout will retire it cleanly and release the baseRef
+					// slot at that point.
+					continue;
 				}
-				// Card may have been dragged out by the user, trashed manually
-				// or otherwise moved while the cherry-pick is in flight. Keep
-				// the entry — verification or the grace timeout will retire
-				// it cleanly and release the baseRef slot at that point.
+				if (trashCardIds.has(taskId)) {
+					// Trashed-while-armed: drop the entry and release the
+					// slot. There is no path back from trash, so the queued
+					// siblings on this baseRef would block forever otherwise.
+					clearTimer(entry);
+					clearVerificationRecheck(entry);
+					pendingByTaskId.delete(taskId);
+					latestMetadataByTaskId.delete(taskId);
+					releaseSlot(entry.baseRef, taskId);
+					releaseMetadataSubscription(entry.workspaceId);
+					logInfo(`${logTag(taskId, entry.baseRef)} armed but card moved to trash — releasing slot`);
+					continue;
+				}
+				// Card moved out of review/in_progress to some other column
+				// (rare but possible if a user manually edits the board).
+				// Keep tracking — verification or grace timeout still owns
+				// the slot release.
 				continue;
 			}
 			const sinceRegistered = Date.now() - entry.registeredAt;
