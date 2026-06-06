@@ -75,6 +75,18 @@ export interface RuntimeStateHub {
 	subscribeWorkspaceMetadataMonitor: (workspaceId: string, workspacePath: string) => Promise<void>;
 	unsubscribeWorkspaceMetadataMonitor: (workspaceId: string) => void;
 	getCurrentWorkspaceMetadata: (workspaceId: string) => RuntimeWorkspaceMetadata | null;
+	/**
+	 * Signals that the server is shutting down (SIGTERM / SIGINT). Causes
+	 * the PTY-exit column-sync listeners to short-circuit: instead of
+	 * issuing async board mutations that might partially persist before
+	 * the process dies (the same race that lost RDFIX03/RDFIX04/ENUM02/
+	 * COMPLEXITY01/TYPESAFE01 on 2026-06-05 when their cards landed in
+	 * trash after the SIGTERM cascade fired the listener mid-shutdown),
+	 * leave the persisted board state exactly as it was at the moment of
+	 * shutdown. Auto-resume on the next boot then sees the cards in
+	 * their pre-shutdown column and spawns `--continue` agents.
+	 */
+	setShuttingDown: () => void;
 	close: () => Promise<void>;
 }
 
@@ -564,6 +576,14 @@ export function createRuntimeStateHub(deps: CreateRuntimeStateHubDependencies): 
 		}
 	});
 
+	// Shutdown guard. Set to true by setShuttingDown() (invoked from the
+	// SIGTERM / SIGINT handler in runtime-server.ts). PTY-exit column-sync
+	// listeners must check this before issuing any board mutation —
+	// otherwise async writes started during the SIGTERM cascade can
+	// partially persist and silently move active cards to trash, losing
+	// uncommitted work. See the 2026-06-05 incident notes in the
+	// setShuttingDown comment above.
+	let shuttingDown = false;
 	return {
 		trackTerminalManager: (workspaceId: string, manager: TerminalSessionManager) => {
 			if (terminalSummaryUnsubscribeByWorkspaceId.has(workspaceId)) {
@@ -593,6 +613,7 @@ export function createRuntimeStateHub(deps: CreateRuntimeStateHubDependencies): 
 				// `attention` is included too (workspace-trust prompts in
 				// codex surface as awaiting_review without a Stop hook).
 				if (
+					!shuttingDown &&
 					previous &&
 					previous.state === "running" &&
 					summary.state === "awaiting_review" &&
@@ -612,6 +633,7 @@ export function createRuntimeStateHub(deps: CreateRuntimeStateHubDependencies): 
 					}
 				}
 				if (
+					!shuttingDown &&
 					previous &&
 					previous.state !== "interrupted" &&
 					summary.state === "interrupted" &&
@@ -675,6 +697,7 @@ export function createRuntimeStateHub(deps: CreateRuntimeStateHubDependencies): 
 					broadcastTaskReadyForReview(workspaceId, summary.taskId);
 				}
 				if (
+					!shuttingDown &&
 					previousSummary &&
 					previousSummary.state !== "interrupted" &&
 					summary.state === "interrupted" &&
@@ -684,7 +707,9 @@ export function createRuntimeStateHub(deps: CreateRuntimeStateHubDependencies): 
 					// surface the dead session as needing review, never
 					// auto-trash. Preserves the worktree, the plan file,
 					// and any uncommitted work so the user can decide
-					// whether to resume or abandon.
+					// whether to resume or abandon. Skipped during
+					// shutdown so the SIGTERM cascade can't race
+					// async writes that partially persist trash moves.
 					void deps.autoReviewManagerRef.current
 						.moveTaskInProgressToReview(workspaceId, workspacePath, summary.taskId)
 						.catch(() => {
@@ -733,6 +758,9 @@ export function createRuntimeStateHub(deps: CreateRuntimeStateHubDependencies): 
 		},
 		getCurrentWorkspaceMetadata: (workspaceId) => {
 			return workspaceMetadataMonitor.getCurrentMetadata(workspaceId);
+		},
+		setShuttingDown: () => {
+			shuttingDown = true;
 		},
 		close: async () => {
 			for (const timer of taskSessionBroadcastTimersByWorkspaceId.values()) {

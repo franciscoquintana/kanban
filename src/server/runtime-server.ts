@@ -281,6 +281,31 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		logError("[auto-resume] top-level pass failed", err);
 	});
 
+	// Graceful-shutdown signal handlers. The PTY-exit listeners in
+	// runtime-state-hub.ts would otherwise fire `moveTaskInProgressToReview`
+	// for each terminating child during the SIGTERM cascade — those async
+	// writes can partially persist before the process dies, silently moving
+	// active cards to trash (see the 2026-06-05 incident that lost
+	// RDFIX03/RDFIX04/ENUM02/COMPLEXITY01/TYPESAFE01 and their worktrees).
+	// Setting `shuttingDown` on the runtime-state-hub disables those
+	// listeners so the persisted board.json stays exactly as it was at the
+	// moment of shutdown; auto-resume-on-boot then sees the cards in their
+	// pre-shutdown column on the next start and spawns `--continue` agents
+	// for them. The handlers are idempotent and do NOT call process.exit:
+	// we let the existing teardown path run (or, on a hard kill, the
+	// process dies normally) — the only behaviour change is suppressing
+	// the racy column moves during the cascade.
+	const onShutdownSignal = (signal: NodeJS.Signals) => {
+		try {
+			deps.runtimeStateHub.setShuttingDown();
+		} catch (err) {
+			logError(`[shutdown] failed to mark runtime-state-hub as shutting down on ${signal}`, err);
+		}
+	};
+	process.once("SIGTERM", () => onShutdownSignal("SIGTERM"));
+	process.once("SIGINT", () => onShutdownSignal("SIGINT"));
+	process.once("SIGHUP", () => onShutdownSignal("SIGHUP"));
+
 	const prepareForStateReset = async (): Promise<void> => {
 		const workspaceIds = new Set<string>();
 		for (const { workspaceId } of deps.workspaceRegistry.listManagedWorkspaces()) {
