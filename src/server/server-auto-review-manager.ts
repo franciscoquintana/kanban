@@ -40,7 +40,7 @@ import { buildTaskGitActionPrompt, type TaskGitAction } from "../git-actions/bui
 import { isNativeClineAgentSelected } from "../runtime/native-agent.js";
 import { loadWorkspaceBoardById, mutateWorkspaceState } from "../state/workspace-state.js";
 import type { TerminalSessionManager } from "../terminal/session-manager.js";
-import { countCommitsAheadOfBaseRef, getBranchTip } from "../workspace/git-sync.js";
+import { countCommitsAheadOfBaseRef, getBranchTip, isCardCommitInBaseRefRange } from "../workspace/git-sync.js";
 import { getTaskWorkspacePathInfo } from "../workspace/task-worktree.js";
 import { logError, logInfo, logWarn } from "./server-log.js";
 import { BG_ACTIVE_FILE_NAME, NEEDS_INPUT_FILE_NAME } from "./two-phase.js";
@@ -768,8 +768,65 @@ export function createServerAutoReviewManager(
 					);
 					return;
 				}
+				// Cross-card false-positive guard: the tip moved, but it may have
+				// moved because of a SIBLING card's cherry-pick on the same baseRef
+				// rather than our own. Without this check, the 2026-06-07 incident
+				// loses the still-pending card's commit (orphan in git, gone from
+				// the board). Verify our card's commit actually appears in the
+				// `(baseRefTipAtArm, tipNow]` range by subject — cherry-pick
+				// preserves the subject by default. Treat a `null` return
+				// (helper couldn't read git) as "can't verify, fall through to
+				// the grace-recheck path"; a `false` return is the definitive
+				// "sibling card cherry-picked first, our commit hasn't landed
+				// yet — keep waiting".
+				let cardCommitLandedInRange: boolean | null = null;
+				try {
+					const cardPathInfo = await getTaskWorkspacePathInfo({
+						cwd: entry.workspacePath,
+						taskId: entry.taskId,
+						baseRef: entry.baseRef,
+					});
+					if (cardPathInfo.exists) {
+						cardCommitLandedInRange = await isCardCommitInBaseRefRange({
+							cardWorktreePath: cardPathInfo.path,
+							baseRefRepoPath: entry.workspacePath,
+							baseRefTipAtArm: entry.baseRefTipAtArm,
+							tipNow,
+						});
+					}
+				} catch {
+					cardCommitLandedInRange = null;
+				}
+				if (cardCommitLandedInRange === false) {
+					const elapsedSinceArm = entry.armedAt === null ? Number.POSITIVE_INFINITY : Date.now() - entry.armedAt;
+					if (elapsedSinceArm < VERIFICATION_GRACE_PERIOD_MS) {
+						if (entry.verificationRecheckTimer === null) {
+							const remaining = Math.max(0, VERIFICATION_GRACE_PERIOD_MS - elapsedSinceArm);
+							const recheckDelay = Math.min(VERIFICATION_RECHECK_INTERVAL_MS, remaining);
+							logInfo(
+								`${logTag(entry.taskId, entry.baseRef)} baseRef advanced ${entry.baseRefTipAtArm} → ${tipNow} but our card's commit subject is not in the range — sibling card cherry-picked first, waiting ${recheckDelay}ms (grace=${Math.round(remaining / 1000)}s left)`,
+							);
+							const timer = setTimeout(() => {
+								entry.verificationRecheckTimer = null;
+								if (pendingByTaskId.get(entry.taskId) !== entry) return;
+								if (!entry.armed) return;
+								void evaluate(entry).catch((err) => {
+									logError(`${logTag(entry.taskId, entry.baseRef)} verification recheck failed:`, err);
+								});
+							}, recheckDelay);
+							timer.unref?.();
+							entry.verificationRecheckTimer = timer;
+						}
+						return;
+					}
+					disarmWithoutTrash(
+						entry,
+						`baseRef advanced ${entry.baseRefTipAtArm} → ${tipNow} but our card's commit subject never appeared in the range within ${VERIFICATION_GRACE_PERIOD_MS / 1000}s. A sibling card cherry-picked first; our commit may be orphaned in the worktree.`,
+					);
+					return;
+				}
 				logInfo(
-					`${logTag(entry.taskId, entry.baseRef)} baseRef advanced ${entry.baseRefTipAtArm} → ${tipNow}, scheduling trash`,
+					`${logTag(entry.taskId, entry.baseRef)} baseRef advanced ${entry.baseRefTipAtArm} → ${tipNow}${cardCommitLandedInRange === true ? " (card subject confirmed in range)" : " (subject check inconclusive)"}, scheduling trash`,
 				);
 				scheduleAction(entry, "move_to_trash", () => {
 					void executeMoveToTrash(entry);

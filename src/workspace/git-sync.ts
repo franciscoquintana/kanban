@@ -48,6 +48,59 @@ export async function getBranchTip(repoPath: string, baseRef: string): Promise<s
 }
 
 /**
+ * Verify whether the card worktree's HEAD commit was actually cherry-picked
+ * into `baseRef` in the range `(baseRefTipAtArm, tipNow]`, vs. the baseRef
+ * tip having just advanced via some sibling card's cherry-pick.
+ *
+ * Without this check, the auto-review verification path treats any baseRef
+ * tip advance as proof the armed card's commit landed — but multiple cards
+ * racing on the same baseRef can mutate the tip via each other's commits,
+ * falsely trashing a still-pending card whose own cherry-pick silently
+ * failed (conflicts, dirty index, race with stash pop, etc.). The 2026-06-07
+ * incident lost RDFIX03 (02bf7) this way: it was scheduled for trash because
+ * TYPESAFE01 (bdcf0) cherry-picked first; RDFIX03's commit was orphaned and
+ * had to be recovered manually from the `git log --all` haystack.
+ *
+ * Method: cherry-pick preserves the commit subject by default, so compare
+ * the card worktree's HEAD subject against subjects of commits that landed
+ * on baseRef in the range. A match means the cherry-pick succeeded; no match
+ * means the tip moved for an unrelated reason and we should keep waiting
+ * (within the grace window) or disarm.
+ *
+ * Returns `null` if any git call fails (worktree missing, range invalid,
+ * etc.). Caller treats `null` as "can't verify" and falls back to the
+ * conservative grace-recheck path.
+ */
+export async function isCardCommitInBaseRefRange(input: {
+	cardWorktreePath: string;
+	baseRefRepoPath: string;
+	baseRefTipAtArm: string;
+	tipNow: string;
+}): Promise<boolean | null> {
+	const subjectRes = await runGit(input.cardWorktreePath, ["log", "-1", "--format=%s", "HEAD"]);
+	if (!subjectRes.ok) {
+		return null;
+	}
+	const cardSubject = subjectRes.stdout.trim();
+	if (!cardSubject) {
+		return null;
+	}
+	const rangeRes = await runGit(input.baseRefRepoPath, [
+		"log",
+		"--format=%s",
+		`${input.baseRefTipAtArm}..${input.tipNow}`,
+	]);
+	if (!rangeRes.ok) {
+		return null;
+	}
+	const subjects = rangeRes.stdout
+		.split("\n")
+		.map((s) => s.trim())
+		.filter((s) => s.length > 0);
+	return subjects.includes(cardSubject);
+}
+
+/**
  * Count commits reachable from HEAD that are NOT reachable from baseRef
  * (i.e. local commits in the worktree that have not been merged/cherry-picked
  * onto baseRef yet). Returns null if the command fails (worktree missing,
